@@ -258,27 +258,54 @@ class BrowserFetcher:
             return {"error": "no page loaded"}
         try:
             result = self._page.evaluate(f"""() => {{
-                // Remove existing highlights
+                const requested = {json.dumps(eids)};
+                const totalElements = document.querySelectorAll('a, button, input, textarea, select, [tabindex]').length;
+
                 document.querySelectorAll('.surfboard-highlight').forEach(el => {{
                     el.style.outline = el.dataset.surfboardOrigOutline || '';
                     el.style.backgroundColor = el.dataset.surfboardOrigBg || '';
                     el.classList.remove('surfboard-highlight');
                 }});
-                if ({json.dumps(eids)}.length === 0) return 'cleared';
+
+                if (requested.length === 0) return {{ status: 'cleared', total_elements: totalElements }};
+
+                const found = [];
+                const notFound = [];
                 let count = 0;
                 document.querySelectorAll('a, button, input, textarea, select, [tabindex]').forEach((el, idx) => {{
-                    if ({json.dumps(eids)}.includes(idx + 1)) {{
+                    const eid = idx + 1;
+                    if (requested.includes(eid)) {{
                         el.dataset.surfboardOrigOutline = el.style.outline;
                         el.dataset.surfboardOrigBg = el.style.backgroundColor;
                         el.style.outline = '3px solid #FFD93D';
                         el.style.backgroundColor = 'rgba(255, 217, 61, 0.15)';
                         el.classList.add('surfboard-highlight');
+                        found.push(eid);
                         count++;
                     }}
                 }});
-                return 'highlighted ' + count + ' elements';
+
+                requested.forEach(id => {{
+                    if (!found.includes(id)) notFound.push(id);
+                }});
+
+                return {{
+                    status: 'highlighted ' + count + ' of ' + requested.length + ' elements',
+                    found: found,
+                    not_found: notFound,
+                    total_elements: totalElements
+                }};
             }}""")
             return {"result": result}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def wait_for_element(self, selector: str, timeout_ms: int = 10000) -> dict:
+        if not self._page:
+            return {"error": "no page loaded"}
+        try:
+            self._page.wait_for_selector(selector, timeout=timeout_ms)
+            return {"found": True, "selector": selector, "timeout_ms": timeout_ms}
         except Exception as e:
             return {"error": str(e)}
 

@@ -68,6 +68,7 @@ class SurfboardMCPServer:
                     "properties": {
                         "id": {"type": "integer", "description": "The element ID to click"},
                         "tab_id": {"type": "integer", "description": "Tab to operate on (from browse result)"},
+                        "minimal": {"type": "boolean", "description": "Skip fetching the updated page (default: false)"},
                     },
                     "required": ["id"],
                 },
@@ -114,6 +115,7 @@ class SurfboardMCPServer:
                     "properties": {
                         "id": {"type": "integer", "description": "The section ID to expand"},
                         "tab_id": {"type": "integer", "description": "Tab to operate on (from browse result)"},
+                        "minimal": {"type": "boolean", "description": "Skip returning the full page (default: false)"},
                     },
                     "required": ["id"],
                 },
@@ -126,6 +128,7 @@ class SurfboardMCPServer:
                     "properties": {
                         "id": {"type": "integer", "description": "The section ID to collapse"},
                         "tab_id": {"type": "integer", "description": "Tab to operate on (from browse result)"},
+                        "minimal": {"type": "boolean", "description": "Skip returning the full page (default: false)"},
                     },
                     "required": ["id"],
                 },
@@ -296,7 +299,7 @@ class SurfboardMCPServer:
             },
             {
                 "name": "highlight",
-                "description": "Highlight elements on the page by their element IDs (yellow outline + background)",
+                "description": "Highlight elements on the page by their element IDs (yellow outline + background). Returns per-ID status.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -304,6 +307,41 @@ class SurfboardMCPServer:
                         "tab_id": {"type": "integer", "description": "Tab to operate on"},
                     },
                     "required": ["ids"],
+                },
+            },
+            {
+                "name": "tab_close",
+                "description": "Close the active tab (cannot close the last remaining tab)",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "tab_id": {"type": "integer", "description": "Tab ID to close (omit for active tab)"},
+                    },
+                },
+            },
+            {
+                "name": "get_section",
+                "description": "Get the full untruncated content of a specific section by its ID",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer", "description": "The section ID"},
+                        "tab_id": {"type": "integer", "description": "Tab to operate on"},
+                    },
+                    "required": ["id"],
+                },
+            },
+            {
+                "name": "wait_for_element",
+                "description": "Wait for a CSS selector to appear on the page (for SPAs/dynamic content)",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "selector": {"type": "string", "description": "CSS selector to wait for"},
+                        "timeout_ms": {"type": "integer", "description": "Maximum wait time in milliseconds (default 10000)"},
+                        "tab_id": {"type": "integer", "description": "Tab to operate on"},
+                    },
+                    "required": ["selector"],
                 },
             },
         ]
@@ -326,7 +364,7 @@ class SurfboardMCPServer:
             result = self.api._navigate(url, tab_id=args.get("tab_id"))
         elif name == "click":
             eid = args.get("id", 0)
-            result = self.api._click(str(eid), tab_id=args.get("tab_id"))
+            result = self.api._click(str(eid), tab_id=args.get("tab_id"), minimal=args.get("minimal", False))
         elif name == "fill":
             result = self.api._fill(args.get("id", 0), args.get("text", ""), tab_id=args.get("tab_id"))
         elif name == "search":
@@ -335,9 +373,9 @@ class SurfboardMCPServer:
         elif name == "get_page":
             result = self.api._get_page(tab_id=args.get("tab_id"))
         elif name == "expand":
-            result = self.api._expand(args.get("id", 0), tab_id=args.get("tab_id"))
+            result = self.api._expand(args.get("id", 0), tab_id=args.get("tab_id"), minimal=args.get("minimal", False))
         elif name == "collapse":
-            result = self.api._collapse(args.get("id", 0), tab_id=args.get("tab_id"))
+            result = self.api._collapse(args.get("id", 0), tab_id=args.get("tab_id"), minimal=args.get("minimal", False))
         elif name == "back":
             result = self.api._back()
         elif name == "forward":
@@ -346,6 +384,8 @@ class SurfboardMCPServer:
             result = self.api._tab_new()
         elif name == "tab_switch":
             result = self.api._tab_switch(args.get("id", 0))
+        elif name == "tab_close":
+            result = self.api._tab_close()
         elif name == "refresh":
             result = self.api._refresh()
         elif name == "status":
@@ -360,6 +400,8 @@ class SurfboardMCPServer:
             result = self.api._fill_and_submit(args.get("id", 0), args.get("text", ""), tab_id=args.get("tab_id"))
         elif name == "wait_for_load":
             result = self.api._wait_for_load(args.get("timeout_ms", 10000), tab_id=args.get("tab_id"))
+        elif name == "wait_for_element":
+            result = self.api._wait_for_element(args.get("selector", ""), args.get("timeout_ms", 10000), tab_id=args.get("tab_id"))
         elif name == "scroll_to":
             result = self.api._scroll_to(args.get("id", 0), tab_id=args.get("tab_id"))
         elif name == "scroll_by":
@@ -374,6 +416,8 @@ class SurfboardMCPServer:
             result = self.api._clipboard_read(tab_id=args.get("tab_id"))
         elif name == "highlight":
             result = self.api._highlight(args.get("ids", []), tab_id=args.get("tab_id"))
+        elif name == "get_section":
+            result = self.api._get_section(args.get("id", 0), tab_id=args.get("tab_id"))
         else:
             return {
                 "jsonrpc": "2.0",

@@ -125,7 +125,7 @@ class SurfboardAPI:
         if cmd == "navigate" or cmd == "open":
             return self._navigate(params.get("url", ""))
         elif cmd == "click":
-            return self._click(params.get("id", "") or params.get("target", ""))
+            return self._click(params.get("id", "") or params.get("target", ""), minimal=params.get("minimal", False))
         elif cmd == "search":
             return self._search(params.get("query", ""))
         elif cmd == "fill":
@@ -246,7 +246,7 @@ class SurfboardAPI:
             return f"a[href={_css_quote(el.href)}]"
         return tag
 
-    def _click(self, target: str, tab_id: int | None = None) -> dict[str, Any]:
+    def _click(self, target: str, tab_id: int | None = None, minimal: bool = False) -> dict[str, Any]:
         if tab_id is not None:
             self.session.switch_tab(tab_id)
         tab = self.session.active_tab
@@ -269,10 +269,15 @@ class SurfboardAPI:
             self.fetcher.wait_for_load(timeout_ms=1000)
             html = self.fetcher.content()
             url = self.fetcher.current_url() or tab.url
-            if html:
+            if html and not minimal:
                 tab.url = url
                 tab.page = build_page(html, tab.url, url)
-            return {"clicked": el.id, "type": el.type.value, "label": el.label, "selector": selector}
+            elif html:
+                tab.url = url
+            result: dict[str, Any] = {"clicked": el.id, "type": el.type.value, "label": el.label, "selector": selector}
+            if not minimal and tab and tab.page:
+                result["page"] = _page_to_dict(tab.page)
+            return result
 
         return {"error": f"Invalid target: {target}"}
 
@@ -310,6 +315,8 @@ class SurfboardAPI:
         selector = self._build_selector(el)
         result = self.fetcher.hover(selector)
         if "error" in result:
+            result["element_id"] = element_id
+            result["hint"] = "The page DOM may have changed since this element was loaded. Use get_page() to refresh the element list."
             return result
         return {"hovered": element_id, "label": el.label, "selector": selector}
 
@@ -325,6 +332,8 @@ class SurfboardAPI:
         selector = self._build_selector(el)
         result = self.fetcher.scroll_to(selector)
         if "error" in result:
+            result["element_id"] = element_id
+            result["hint"] = "The page DOM may have changed since this element was loaded. Use get_page() to refresh the element list."
             return result
         return {"scrolled_to": element_id, "label": el.label, "selector": selector}
 
@@ -349,15 +358,16 @@ class SurfboardAPI:
             if "error" in press:
                 result["submitted"] = False
                 result["submit_error"] = press["error"]
+                result["element_id"] = element_id
             else:
                 result["submitted"] = True
-                # Get current URL after submit
                 url = self.fetcher.evaluate("window.location.href")
                 if not url.startswith("error"):
                     result["url_after"] = url
         except Exception as e:
             result["submitted"] = False
-            result["submit_error"] = str(e)
+            result["submit_error"] = f"element #{element_id}: {e}"
+            result["element_id"] = element_id
         return result
 
     def _evaluate(self, js_code: str, tab_id: int | None = None) -> dict[str, Any]:
@@ -423,15 +433,19 @@ class SurfboardAPI:
         tab = self.session.active_tab
         if tab and tab.can_go_back():
             tab.go_back()
-            return self._navigate(tab.history[tab.history_index], tab_id=tab.id, push_history=False)
-        return {"error": "No previous page"}
+            result = self._navigate(tab.history[tab.history_index], tab_id=tab.id, push_history=False)
+            result["back"] = True
+            return result
+        return {"back": False}
 
     def _forward(self) -> dict[str, Any]:
         tab = self.session.active_tab
         if tab and tab.can_go_forward():
             tab.go_forward()
-            return self._navigate(tab.history[tab.history_index], tab_id=tab.id, push_history=False)
-        return {"error": "No next page"}
+            result = self._navigate(tab.history[tab.history_index], tab_id=tab.id, push_history=False)
+            result["forward"] = True
+            return result
+        return {"forward": False}
 
     def _tab_new(self) -> dict[str, Any]:
         tab = self.session.create_tab()
@@ -462,7 +476,7 @@ class SurfboardAPI:
             return {"tab_id": tab.id, "page": _page_to_dict(tab.page)}
         return {"page": None}
 
-    def _expand(self, section_id: int, tab_id: int | None = None) -> dict[str, Any]:
+    def _expand(self, section_id: int, tab_id: int | None = None, minimal: bool = False) -> dict[str, Any]:
         if tab_id is not None:
             self.session.switch_tab(tab_id)
         tab = self.session.active_tab
@@ -472,9 +486,12 @@ class SurfboardAPI:
         if not section:
             return {"error": f"No section with ID {section_id}"}
         section.collapsed = False
-        return {"tab_id": tab.id, "page": _page_to_dict(tab.page)}
+        result: dict[str, Any] = {"tab_id": tab.id, "expanded": section_id}
+        if not minimal:
+            result["page"] = _page_to_dict(tab.page)
+        return result
 
-    def _collapse(self, section_id: int, tab_id: int | None = None) -> dict[str, Any]:
+    def _collapse(self, section_id: int, tab_id: int | None = None, minimal: bool = False) -> dict[str, Any]:
         if tab_id is not None:
             self.session.switch_tab(tab_id)
         tab = self.session.active_tab
@@ -484,7 +501,38 @@ class SurfboardAPI:
         if not section:
             return {"error": f"No section with ID {section_id}"}
         section.collapsed = True
-        return {"tab_id": tab.id, "page": _page_to_dict(tab.page)}
+        result: dict[str, Any] = {"tab_id": tab.id, "collapsed": section_id}
+        if not minimal:
+            result["page"] = _page_to_dict(tab.page)
+        return result
+
+    def _get_section(self, section_id: int, tab_id: int | None = None) -> dict[str, Any]:
+        if tab_id is not None:
+            self.session.switch_tab(tab_id)
+        tab = self.session.active_tab
+        if not tab or not tab.page:
+            return {"error": "No page loaded"}
+        section = _find_section(tab.page.sections, section_id)
+        if not section:
+            return {"error": f"No section with ID {section_id}"}
+        result = _section_to_dict(section)
+        result["full_content"] = section.full_content or section.content or ""
+        # Collect all subsection content recursively
+        full_parts = [result["full_content"]]
+        def _collect(subs):
+            for sub in subs:
+                fc = sub.full_content or sub.content or ""
+                if fc:
+                    full_parts.append(fc)
+                _collect(sub.subsections)
+        _collect(section.subsections)
+        result["full_content"] = "\n\n".join(full_parts)
+        return {"section": result}
+
+    def _wait_for_element(self, selector: str, timeout_ms: int = 10000, tab_id: int | None = None) -> dict[str, Any]:
+        if tab_id is not None:
+            self.session.switch_tab(tab_id)
+        return self.fetcher.wait_for_element(selector, int(timeout_ms))
 
     def _status(self) -> dict[str, Any]:
         tab = self.session.active_tab

@@ -49,6 +49,7 @@ def build_page(html: str, url: str, final_url: str) -> Page:
                 title="Page Content",
                 level=1,
                 content=_truncate_text(text),
+                full_content=text,
                 elements=page.elements,
             )
         ]
@@ -108,6 +109,7 @@ def _build_sections(
             title=title,
             level=level,
             content=_truncate_text(content),
+            full_content=content,
             section_id=next(section_id_gen),
         )
 

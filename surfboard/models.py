@@ -70,6 +70,7 @@ class Section:
     subsections: list[Section] = field(default_factory=list)
     collapsed: bool = False
     collapsed_by_default: bool = False
+    full_content: str = ""
 
     def total_lines(self) -> int:
         lines = len(self.content.splitlines()) if self.content else 0
