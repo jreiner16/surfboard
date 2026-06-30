@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 from pathlib import Path
+import re
+import urllib.request
 
 from surfboard.fetcher import FetchResult, _is_bot_block
 
@@ -78,7 +81,7 @@ Object.defineProperty(navigator, 'hardwareConcurrency', {
 
 
 class BrowserFetcher:
-    def __init__(self, timeout: float = 15.0):
+    def __init__(self, timeout: float = 30.0):
         self.timeout = timeout
         self._playwright = None
         self._browser = None
@@ -107,6 +110,7 @@ class BrowserFetcher:
         )
         self._page = self._context.new_page()
         self._page.add_init_script(_STEALTH_INIT_SCRIPT)
+        self._page.set_default_timeout(10000)
 
         # Capture console logs
         self._console_logs = []
@@ -156,7 +160,6 @@ class BrowserFetcher:
 
         try:
             self._page.goto(url, wait_until="domcontentloaded", timeout=int(self.timeout * 1000))
-            self._page.wait_for_timeout(1500)
 
             if _is_bot_block(self._page.content(), 200):
                 return FetchResult(
@@ -211,6 +214,56 @@ class BrowserFetcher:
         except Exception:
             return None
 
+    def is_pdf(self) -> bool:
+        if not self._page:
+            return False
+        try:
+            ct = self._page.evaluate("document.contentType || ''")
+            return "pdf" in ct.lower()
+        except Exception:
+            return False
+
+    def fetch_pdf_text(self) -> str | None:
+        """Extract text from a PDF loaded in the browser. Falls back to pypdf2."""
+        if not self._page:
+            return None
+        # Try browser's built-in PDF viewer text layer first
+        try:
+            text = self._page.evaluate("""() => {
+                const el = document.querySelector('embed[type="application/pdf"], iframe[src*=".pdf"]');
+                if (el) return 'PDF embed found — use fallback extractor';
+                return document.body.innerText || '';
+            }""")
+            if text and len(text) > 20:
+                return text
+        except Exception:
+            pass
+
+        # Fallback: download PDF bytes and extract with pypdf2
+        try:
+            pdf_url = self._page.url
+            from PyPDF2 import PdfReader
+
+            req = urllib.request.Request(
+                pdf_url,
+                headers={"User-Agent": self._page.evaluate("navigator.userAgent")},
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                pdf_bytes = resp.read()
+
+            reader = PdfReader(io.BytesIO(pdf_bytes))
+            pages = []
+            for page in reader.pages:
+                t = page.extract_text()
+                if t:
+                    pages.append(t)
+            if pages:
+                return "\n\n".join(pages)
+        except Exception:
+            pass
+
+        return None
+
     def content(self) -> str:
         if not self._page:
             return ""
@@ -227,11 +280,29 @@ class BrowserFetcher:
         except Exception:
             return ""
 
+    def go_back(self) -> dict:
+        if not self._page:
+            return {"error": "no page loaded"}
+        try:
+            self._page.go_back()
+            return {"navigated": True}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def go_forward(self) -> dict:
+        if not self._page:
+            return {"error": "no page loaded"}
+        try:
+            self._page.go_forward()
+            return {"navigated": True}
+        except Exception as e:
+            return {"error": str(e)}
+
     def wait_for_load(self, timeout_ms: int = 10000) -> dict:
         if not self._page:
             return {"error": "no page loaded"}
         try:
-            self._page.wait_for_load_state("networkidle", timeout=timeout_ms)
+            self._page.wait_for_load_state("load", timeout=timeout_ms)
             return {"loaded": True, "timeout_ms": timeout_ms}
         except Exception as e:
             return {"error": str(e)}
@@ -259,7 +330,7 @@ class BrowserFetcher:
                 el = self._page.query_selector(sel)
                 if el:
                     self._scroll_into_view(sel)
-                    self._page.click(sel)
+                    self._page.click(sel, timeout=15000)
                     return {"clicked": sel, "selector_used": sel}
             except Exception as e:
                 last_error = str(e)
@@ -267,30 +338,44 @@ class BrowserFetcher:
 
         return {"error": f"click failed for all selectors: {last_error}"}
 
-    def hover(self, selector: str) -> dict:
+    def hover(self, selector: str, fallback_selectors: list[str] | None = None) -> dict:
         if not self._page:
             return {"error": "no page loaded"}
-        try:
-            self._page.hover(selector)
-            return {"hovered": selector}
-        except Exception as e:
-            return {"error": str(e)}
+        selectors_to_try = [selector]
+        if fallback_selectors:
+            selectors_to_try.extend(fallback_selectors)
+        last_error = None
+        for sel in selectors_to_try:
+            try:
+                el = self._page.query_selector(sel)
+                if el:
+                    self._page.hover(sel, timeout=10000)
+                    return {"hovered": sel, "selector_used": sel}
+            except Exception as e:
+                last_error = str(e)
+                continue
+        return {"error": f"hover failed for all selectors: {last_error}"}
 
-    def scroll_to(self, selector: str) -> dict:
+    def scroll_to(self, selector: str, fallback_selectors: list[str] | None = None) -> dict:
         if not self._page:
             return {"error": "no page loaded"}
-        try:
-            result = self._page.evaluate(f"""() => {{
-                const el = document.querySelector({json.dumps(selector)});
-                if (!el) return null;
-                el.scrollIntoView({{block: 'center', behavior: 'smooth'}});
-                return true;
-            }}""")
-            if result is None:
-                return {"error": f"Element not found: {selector}"}
-            return {"scrolled_to": selector}
-        except Exception as e:
-            return {"error": str(e)}
+        selectors_to_try = [selector]
+        if fallback_selectors:
+            selectors_to_try.extend(fallback_selectors)
+        for sel in selectors_to_try:
+            try:
+                result = self._page.evaluate(f"""() => {{
+                    const el = document.querySelector({json.dumps(sel)});
+                    if (!el) return null;
+                    el.scrollIntoView({{block: 'center', behavior: 'instant'}});
+                    return true;
+                }}""")
+                if result is True:
+                    self._page.wait_for_timeout(200)
+                    return {"scrolled_to": sel, "selector_used": sel}
+            except Exception:
+                continue
+        return {"error": f"Element not found for any selector (tried {len(selectors_to_try)} selectors)"}
 
     def scroll_by(self, x: int, y: int) -> dict:
         if not self._page:
@@ -336,10 +421,8 @@ class BrowserFetcher:
             # Support key combos: "Ctrl+C", "Shift+Enter", "Ctrl+Shift+F", etc.
             if "+" in key:
                 parts = key.split("+")
-                # All but the last are modifiers, the last is the actual key
                 modifiers = parts[:-1]
                 actual_key = parts[-1]
-                # Map common modifier names
                 mod_map = {"ctrl": "Control", "shift": "Shift", "alt": "Alt", "meta": "Meta"}
                 for mod in modifiers:
                     mapped = mod_map.get(mod.lower(), mod)
@@ -350,6 +433,15 @@ class BrowserFetcher:
                     self._page.keyboard.up(mapped)
             else:
                 self._page.keyboard.press(key)
+
+            # If pressing Enter, wait briefly for potential navigation
+            normalized = key.lower().split("+")[-1]
+            if normalized in ("enter", "return"):
+                try:
+                    self._page.wait_for_load_state("load", timeout=5000)
+                except Exception:
+                    pass  # No navigation happened — that's fine
+
             return {"pressed": key}
         except Exception as e:
             return {"error": str(e)}

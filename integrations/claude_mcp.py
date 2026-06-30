@@ -31,11 +31,11 @@ _TOOL_DEFS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "id": {"type": "integer", "description": "The element ID to click"},
+                "target": {"type": "integer", "description": "The element ID to click"},
                 "tab_id": {"type": "integer", "description": "Tab to operate on (from browse result)"},
                 "minimal": {"type": "boolean", "description": "Skip returning the full page (default: true)"},
             },
-            "required": ["id"],
+            "required": ["target"],
         },
     },
     {
@@ -44,11 +44,11 @@ _TOOL_DEFS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "id": {"type": "integer", "description": "The input element ID"},
+                "element_id": {"type": "integer", "description": "The input element ID"},
                 "text": {"type": "string", "description": "The text to type"},
                 "tab_id": {"type": "integer", "description": "Tab to operate on (from browse result)"},
             },
-            "required": ["id", "text"],
+            "required": ["element_id", "text"],
         },
     },
     {
@@ -57,11 +57,11 @@ _TOOL_DEFS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "id": {"type": "integer"},
+                "element_id": {"type": "integer"},
                 "text": {"type": "string"},
                 "tab_id": {"type": "integer"},
             },
-            "required": ["id", "text"],
+            "required": ["element_id", "text"],
         },
     },
     {
@@ -85,16 +85,19 @@ _TOOL_DEFS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "id": {"type": "integer", "description": "The section ID"},
+                "section_id": {"type": "integer", "description": "The section ID"},
                 "tab_id": {"type": "integer"},
             },
-            "required": ["id"],
+            "required": ["section_id"],
         },
     },
     {
         "name": "get_console_logs",
         "description": "Get accumulated browser console logs (useful for debugging JS errors)",
-        "inputSchema": {"type": "object", "properties": {"tab_id": {"type": "integer"}}},
+        "inputSchema": {
+            "type": "object",
+            "properties": {"tab_id": {"type": "integer", "description": "Tab to get logs from (omit for active tab)"}},
+        },
     },
     {
         "name": "expand",
@@ -102,11 +105,11 @@ _TOOL_DEFS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "id": {"type": "integer", "description": "The section ID to expand"},
+                "section_id": {"type": "integer", "description": "The section ID to expand"},
                 "tab_id": {"type": "integer"},
                 "minimal": {"type": "boolean", "description": "Skip returning the full page (default: true)"},
             },
-            "required": ["id"],
+            "required": ["section_id"],
         },
     },
     {
@@ -115,11 +118,11 @@ _TOOL_DEFS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "id": {"type": "integer", "description": "The section ID to collapse"},
+                "section_id": {"type": "integer", "description": "The section ID to collapse"},
                 "tab_id": {"type": "integer"},
                 "minimal": {"type": "boolean", "description": "Skip returning the full page (default: true)"},
             },
-            "required": ["id"],
+            "required": ["section_id"],
         },
     },
     {
@@ -136,15 +139,19 @@ _TOOL_DEFS: list[dict[str, Any]] = [
     },
     {
         "name": "tab_switch", "description": "Switch to a tab by ID",
-        "inputSchema": {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]},
+        "inputSchema": {"type": "object", "properties": {"tab_id": {"type": "integer"}}, "required": ["tab_id"]},
     },
     {
         "name": "tab_close", "description": "Close the active tab (cannot close the last remaining tab)",
         "inputSchema": {"type": "object", "properties": {"tab_id": {"type": "integer"}}},
     },
     {
-        "name": "refresh", "description": "Refresh the current page",
-        "inputSchema": {"type": "object", "properties": {}},
+        "name": "refresh",
+        "description": "Refresh the current page (optionally specify a tab_id)",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"tab_id": {"type": "integer", "description": "Tab to refresh (omit for active tab)"}},
+        },
     },
     {
         "name": "status",
@@ -157,10 +164,10 @@ _TOOL_DEFS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "js": {"type": "string", "description": "JavaScript code to execute"},
+                "js_code": {"type": "string", "description": "JavaScript code to execute"},
                 "tab_id": {"type": "integer"},
             },
-            "required": ["js"],
+            "required": ["js_code"],
         },
     },
     {
@@ -202,8 +209,8 @@ _TOOL_DEFS: list[dict[str, Any]] = [
         "name": "scroll_to", "description": "Scroll an element into view by its element ID",
         "inputSchema": {
             "type": "object",
-            "properties": {"id": {"type": "integer"}, "tab_id": {"type": "integer"}},
-            "required": ["id"],
+            "properties": {"element_id": {"type": "integer"}, "tab_id": {"type": "integer"}},
+            "required": ["element_id"],
         },
     },
     {
@@ -221,8 +228,8 @@ _TOOL_DEFS: list[dict[str, Any]] = [
         "name": "hover", "description": "Hover over an element by its element ID",
         "inputSchema": {
             "type": "object",
-            "properties": {"id": {"type": "integer"}, "tab_id": {"type": "integer"}},
-            "required": ["id"],
+            "properties": {"element_id": {"type": "integer"}, "tab_id": {"type": "integer"}},
+            "required": ["element_id"],
         },
     },
     {
@@ -258,10 +265,10 @@ _TOOL_DEFS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "ids": {"type": "array", "items": {"type": "integer"}, "description": "Element IDs to highlight (empty array clears highlights)"},
+                "eids": {"type": "array", "items": {"type": "integer"}, "description": "Element IDs to highlight (empty array clears highlights)"},
                 "tab_id": {"type": "integer"},
             },
-            "required": ["ids"],
+            "required": ["eids"],
         },
     },
     {
@@ -271,42 +278,39 @@ _TOOL_DEFS: list[dict[str, Any]] = [
 ]
 
 # Tool name → API method mapping (for _call_tool dispatch)
+# NOTE: param spec keys MUST match the API method parameter names exactly.
 _TOOL_DISPATCH: dict[str, tuple[str, dict[str, Any]]] = {
     "browse": ("_navigate", {"url": "", "tab_id": None, "push_history": True}),
     "click": ("_click", {"target": "", "tab_id": None, "minimal": True}),
-    "fill": ("_fill", {"id": 0, "text": "", "tab_id": None}),
-    "fill_and_submit": ("_fill_and_submit", {"id": 0, "text": "", "tab_id": None}),
+    "fill": ("_fill", {"element_id": 0, "text": "", "tab_id": None}),
+    "fill_and_submit": ("_fill_and_submit", {"element_id": 0, "text": "", "tab_id": None}),
     "search": ("_search", {"query": ""}),
     "get_page": ("_get_page", {"tab_id": None}),
     "get_full_text": ("_get_full_text", {"tab_id": None}),
-    "get_section": ("_get_section", {"id": 0, "tab_id": None}),
-    "get_console_logs": ("_handle_get_console_logs", {}),
-    "expand": ("_expand", {"id": 0, "tab_id": None, "minimal": True}),
-    "collapse": ("_collapse", {"id": 0, "tab_id": None, "minimal": True}),
+    "get_section": ("_get_section", {"section_id": 0, "tab_id": None}),
+    "get_console_logs": ("get_console_logs", {"tab_id": None}),
+    "expand": ("_expand", {"section_id": 0, "tab_id": None, "minimal": True}),
+    "collapse": ("_collapse", {"section_id": 0, "tab_id": None, "minimal": True}),
     "back": ("_back", {}),
     "forward": ("_forward", {}),
     "tab_new": ("_tab_new", {}),
-    "tab_switch": ("_tab_switch", {"id": 0}),
+    "tab_switch": ("_tab_switch", {"tab_id": 0}),
     "tab_close": ("_tab_close", {"tab_id": None}),
-    "refresh": ("_refresh", {}),
+    "refresh": ("_refresh", {"tab_id": None}),
     "status": ("_status", {}),
-    "evaluate": ("_evaluate", {"js": "", "tab_id": None}),
+    "evaluate": ("_evaluate", {"js_code": "", "tab_id": None}),
     "screenshot": ("_screenshot", {"path": None, "tab_id": None}),
     "wait_for_load": ("_wait_for_load", {"timeout_ms": 10000, "tab_id": None}),
     "wait_for_element": ("_wait_for_element", {"selector": "", "timeout_ms": 10000, "tab_id": None}),
-    "scroll_to": ("_scroll_to", {"id": 0, "tab_id": None}),
+    "scroll_to": ("_scroll_to", {"element_id": 0, "tab_id": None}),
     "scroll_by": ("_scroll_by", {"x": 0, "y": 0, "tab_id": None}),
-    "hover": ("_hover", {"id": 0, "tab_id": None}),
+    "hover": ("_hover", {"element_id": 0, "tab_id": None}),
     "press_key": ("_press_key", {"key": "", "tab_id": None}),
     "clipboard_copy": ("_clipboard_copy", {"text": "", "tab_id": None}),
     "clipboard_read": ("_clipboard_read", {"tab_id": None}),
-    "highlight": ("_highlight", {"ids": [], "tab_id": None}),
+    "highlight": ("_highlight", {"eids": [], "tab_id": None}),
     "clear_cookies": ("_clear_cookies", {}),
 }
-
-# Aliases for param names that differ between MCP and API
-_TOOL_PARAM_ALIASES = {"id": "target"}
-
 
 class SurfboardMCPServer:
     def __init__(self) -> None:
@@ -353,18 +357,10 @@ class SurfboardMCPServer:
             "result": {"tools": _TOOL_DEFS},
         }
 
-    def _handle_get_console_logs(self) -> dict[str, Any]:
-        return {"logs": self.api.fetcher.get_console_logs()}
-
     def _call_tool(self, request: dict) -> dict:
         params = request.get("params", {})
         name = params.get("name", "")
-        args = params.get("arguments", {}).copy()
-
-        for alias_from, alias_to in _TOOL_PARAM_ALIASES.items():
-            if alias_from in args and alias_to not in args:
-                args[alias_to] = args[alias_from]
-
+        args = params.get("arguments", {})
         req_id = request.get("id")
 
         entry = _TOOL_DISPATCH.get(name)

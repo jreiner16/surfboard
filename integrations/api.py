@@ -3,8 +3,8 @@ from __future__ import annotations
 import base64
 import inspect
 import json
+import re
 import sys
-import time
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +16,8 @@ from surfboard.serializers import page_to_dict, section_to_dict
 from surfboard.tree import build_page
 
 from integrations.url_rewrite import reddit_json_to_html, rewrite_url
+
+_PDF_EXT_RE = re.compile(r"\.pdf(?:\?|#|$)", re.IGNORECASE)
 
 
 def _css_quote(value: str) -> str:
@@ -37,74 +39,73 @@ class SurfboardAPI:
         self.session = Session()
         self.session.create_tab()
 
-    _HANDLERS: dict[str, tuple[str, list[str]]] = {}  # cmd -> (method_name, param_keys)
+    # Maps legacy param names used by some clients → canonical parameter names
+    _PARAM_ALIASES = [
+        ("id", "target"),
+        ("id", "element_id"),
+        ("id", "section_id"),
+        ("id", "tab_id"),
+        ("js", "js_code"),
+        ("ids", "eids"),
+    ]
 
-    def __init_subclass__(cls, **kwargs):
-        super().__init_subclass__(**kwargs)
+    def handle(self, request: dict[str, Any]) -> dict[str, Any]:
+        cmd = request.get("cmd", request.get("method", ""))
+        params = request.get("params", request.get("arguments", {})).copy()
 
-    _DISPATCH: dict[str, tuple[str, dict[str, Any]]] | None = None
+        for alias_from, alias_to in self._PARAM_ALIASES:
+            if alias_from in params and alias_to not in params:
+                params[alias_to] = params[alias_from]
 
-    def _get_dispatch(self) -> dict[str, tuple[str, dict[str, Any]]]:
-        if self._DISPATCH is not None:
-            return self._DISPATCH
+        # Inline dispatch — single source of truth
         dispatch = {
-            "navigate": ("_navigate", {"url": "", "tab_id": None, "push_history": True}),
-            "open": ("_navigate", {"url": "", "tab_id": None, "push_history": True}),
-            "click": ("_click", {"target": "", "tab_id": None, "minimal": True, "id": 0}),
+            "browse": ("_navigate", {"url": "", "tab_id": None, "push_history": True}),
+            "click": ("_click", {"target": "", "tab_id": None, "minimal": True}),
             "search": ("_search", {"query": ""}),
-            "fill": ("_fill", {"id": 0, "text": "", "tab_id": None}),
-            "fill_and_submit": ("_fill_and_submit", {"id": 0, "text": "", "tab_id": None}),
-            "hover": ("_hover", {"id": 0, "tab_id": None}),
-            "scroll_to": ("_scroll_to", {"id": 0, "tab_id": None}),
+            "fill": ("_fill", {"element_id": 0, "text": "", "tab_id": None}),
+            "fill_and_submit": ("_fill_and_submit", {"element_id": 0, "text": "", "tab_id": None}),
+            "hover": ("_hover", {"element_id": 0, "tab_id": None}),
+            "scroll_to": ("_scroll_to", {"element_id": 0, "tab_id": None}),
             "scroll_by": ("_scroll_by", {"x": 0, "y": 0, "tab_id": None}),
             "wait_for_load": ("_wait_for_load", {"timeout_ms": 10000, "tab_id": None}),
             "wait_for_element": ("_wait_for_element", {"selector": "", "timeout_ms": 10000, "tab_id": None}),
             "back": ("_back", {}),
             "forward": ("_forward", {}),
             "tab_new": ("_tab_new", {}),
-            "tab_switch": ("_tab_switch", {"id": 0}),
+            "tab_switch": ("_tab_switch", {"tab_id": 0}),
             "tab_close": ("_tab_close", {"tab_id": None}),
-            "refresh": ("_refresh", {}),
-            "page": ("_get_page", {"tab_id": None}),
+            "refresh": ("_refresh", {"tab_id": None}),
             "get_page": ("_get_page", {"tab_id": None}),
             "status": ("_status", {}),
-            "evaluate": ("_evaluate", {"js": "", "tab_id": None}),
+            "evaluate": ("_evaluate", {"js_code": "", "tab_id": None}),
             "get_full_text": ("_get_full_text", {"tab_id": None}),
             "screenshot": ("_screenshot", {"path": None, "tab_id": None}),
             "press_key": ("_press_key", {"key": "", "tab_id": None}),
             "clipboard_copy": ("_clipboard_copy", {"text": "", "tab_id": None}),
             "clipboard_read": ("_clipboard_read", {"tab_id": None}),
-            "highlight": ("_highlight", {"ids": [], "tab_id": None}),
-            "get_section": ("_get_section", {"id": 0, "tab_id": None}),
-            "expand": ("_expand", {"id": 0, "tab_id": None, "minimal": True}),
-            "collapse": ("_collapse", {"id": 0, "tab_id": None, "minimal": True}),
+            "highlight": ("_highlight", {"eids": [], "tab_id": None}),
+            "get_section": ("_get_section", {"section_id": 0, "tab_id": None}),
+            "expand": ("_expand", {"section_id": 0, "tab_id": None, "minimal": True}),
+            "collapse": ("_collapse", {"section_id": 0, "tab_id": None, "minimal": True}),
             "clear_cookies": ("_clear_cookies", {}),
         }
-        SurfboardAPI._DISPATCH = dispatch
-        return dispatch
-
-    _PARAM_ALIASES = {"id": "target"}
-
-    def handle(self, request: dict[str, Any]) -> dict[str, Any]:
-        cmd = request.get("cmd", request.get("method", ""))
-        params = request.get("params", request.get("arguments", {})).copy()
-
-        for alias_from, alias_to in self._PARAM_ALIASES.items():
-            if alias_from in params and alias_to not in params:
-                params[alias_to] = params[alias_from]
-
-        dispatch = self._get_dispatch()
         entry = dispatch.get(cmd)
+        if entry is None:
+            # Check for legacy aliases
+            alias_map = {"navigate": "browse", "open": "browse", "page": "get_page"}
+            mapped = alias_map.get(cmd)
+            if mapped:
+                entry = dispatch.get(mapped)
         if entry is None:
             return {
                 "error": f"Unknown command: {cmd!r}",
                 "hint": (
-                    "Available: browse(url), search(query), click(id), "
-                    "fill(id, text), fill_and_submit(id, text), hover(id), "
-                    "scroll_to(id), scroll_by(x, y), wait_for_load(timeout_ms), "
-                    "get_page(), get_full_text(), evaluate(js), back(), forward(), "
+                    "Available: browse(url), search(query), click(target), "
+                    "fill(element_id, text), fill_and_submit(element_id, text), hover(element_id), "
+                    "scroll_to(element_id), scroll_by(x, y), wait_for_load(timeout_ms), "
+                    "get_page(), get_full_text(), evaluate(js_code), back(), forward(), "
                     "refresh(), tab_new(), tab_switch(tab_id), screenshot(), "
-                    "highlight(ids), press_key(key), clipboard_copy(text), "
+                    "highlight(eids), press_key(key), clipboard_copy(text), "
                     "clipboard_read()."
                 ),
             }
@@ -125,6 +126,36 @@ class SurfboardAPI:
             url = "https://" + url
 
         url, rewrite_note = rewrite_url(url)
+
+        # PDF detection — navigate and extract text
+        is_pdf = bool(_PDF_EXT_RE.search(url))
+        if is_pdf:
+            result = self.fetcher.fetch(url)
+            if result.error:
+                _log("browse", url, "error")
+                return {"error": result.error}
+            pdf_text = self.fetcher.fetch_pdf_text()
+            if pdf_text:
+                # Create a minimal page from the PDF text
+                html = f"<html><body><pre>{pdf_text}</pre></body></html>"
+                page = build_page(html, url, result.final_url)
+                page.title = result.final_url.rstrip("/").split("/")[-1]
+                _log("browse", f"PDF: {result.final_url}")
+                if tab_id is not None:
+                    if not self.session.switch_tab(tab_id):
+                        return {"error": f"No tab with ID {tab_id}"}
+                    tab = self.session.active_tab
+                else:
+                    tab = self.session.active_tab
+                    if not tab:
+                        tab = self.session.create_tab()
+                if tab:
+                    tab.url = result.final_url
+                    tab.page = page
+                    if push_history:
+                        tab.push_url(result.final_url)
+                return {"tab_id": tab.id if tab else None, "page": page_to_dict(page), "note": "PDF content extracted"}
+            return {"error": "Could not extract PDF text content"}
 
         result = self.fetcher.fetch(url)
         if result.error:
@@ -250,7 +281,7 @@ class SurfboardAPI:
             click_result = self.fetcher.click(selector, fallback_selectors=fallbacks)
             if "error" in click_result:
                 return {**click_result, "element_id": eid, "hint": "The page DOM may have changed. Use get_page() to refresh."}
-            self.fetcher.wait_for_load(timeout_ms=1000)
+            self.fetcher.wait_for_load(timeout_ms=3000)
             html = self.fetcher.content()
             url = self.fetcher.current_url() or tab.url
             if html and not minimal:
@@ -297,12 +328,13 @@ class SurfboardAPI:
         if not el:
             return {"error": f"No element with ID {element_id}"}
         selector = self._build_selector(el)
-        result = self.fetcher.hover(selector)
+        fallbacks = self._build_fallback_selectors(el)
+        result = self.fetcher.hover(selector, fallback_selectors=fallbacks)
         if "error" in result:
             result["element_id"] = element_id
             result["hint"] = "The page DOM may have changed since this element was loaded. Use get_page() to refresh the element list."
             return result
-        return {"hovered": element_id, "label": el.label, "selector": selector}
+        return {"hovered": element_id, "label": el.label, "selector": result.get("selector_used", selector)}
 
     def _scroll_to(self, element_id: int, tab_id: int | None = None) -> dict[str, Any]:
         if tab_id is not None:
@@ -314,12 +346,13 @@ class SurfboardAPI:
         if not el:
             return {"error": f"No element with ID {element_id}"}
         selector = self._build_selector(el)
-        result = self.fetcher.scroll_to(selector)
+        fallbacks = self._build_fallback_selectors(el)
+        result = self.fetcher.scroll_to(selector, fallback_selectors=fallbacks)
         if "error" in result:
             result["element_id"] = element_id
             result["hint"] = "The page DOM may have changed since this element was loaded. Use get_page() to refresh the element list."
             return result
-        return {"scrolled_to": element_id, "label": el.label, "selector": selector}
+        return {"scrolled_to": element_id, "label": el.label, "selector": result.get("selector_used", selector)}
 
     def _scroll_by(self, x: int, y: int, tab_id: int | None = None) -> dict[str, Any]:
         if tab_id is not None:
@@ -348,12 +381,7 @@ class SurfboardAPI:
             result["submit_error"] = submit_result["error"]
             result["element_id"] = element_id
         else:
-            # Wait a moment for the page to respond
-            time.sleep(0.5)
-            try:
-                self.fetcher.wait_for_load(timeout_ms=2000)
-            except Exception:
-                pass
+            self.fetcher.wait_for_load(timeout_ms=3000)
             result["submitted"] = True
             result["strategy"] = submit_result.get("strategy")
             url = self.fetcher.evaluate("window.location.href")
@@ -381,6 +409,11 @@ class SurfboardAPI:
             return {"result": result}
         except Exception as e:
             return {"error": str(e)}
+
+    def get_console_logs(self, tab_id: int | None = None) -> dict[str, Any]:
+        if tab_id is not None:
+            self.session.switch_tab(tab_id)
+        return {"logs": self.fetcher.get_console_logs()}
 
     def _get_full_text(self, tab_id: int | None = None) -> dict[str, Any]:
         if tab_id is not None:
@@ -443,22 +476,34 @@ class SurfboardAPI:
             return {"error": str(e)}
 
     def _back(self) -> dict[str, Any]:
-        tab = self.session.active_tab
-        if tab and tab.can_go_back():
-            tab.go_back()
-            result = self._navigate(tab.history[tab.history_index], tab_id=tab.id, push_history=False)
-            result["back"] = True
-            return result
-        return {"back": False}
+        try:
+            self.fetcher.go_back()
+            self.fetcher.wait_for_load(timeout_ms=5000)
+            html = self.fetcher.content()
+            url = self.fetcher.current_url()
+            tab = self.session.active_tab
+            if tab and html:
+                tab.url = url
+                tab.page = build_page(html, url, url)
+                tab.push_url(url)
+            return {"back": True, "url": url}
+        except Exception as e:
+            return {"back": False, "error": str(e)}
 
     def _forward(self) -> dict[str, Any]:
-        tab = self.session.active_tab
-        if tab and tab.can_go_forward():
-            tab.go_forward()
-            result = self._navigate(tab.history[tab.history_index], tab_id=tab.id, push_history=False)
-            result["forward"] = True
-            return result
-        return {"forward": False}
+        try:
+            self.fetcher.go_forward()
+            self.fetcher.wait_for_load(timeout_ms=5000)
+            html = self.fetcher.content()
+            url = self.fetcher.current_url()
+            tab = self.session.active_tab
+            if tab and html:
+                tab.url = url
+                tab.page = build_page(html, url, url)
+                tab.push_url(url)
+            return {"forward": True, "url": url}
+        except Exception as e:
+            return {"forward": False, "error": str(e)}
 
     def _tab_new(self) -> dict[str, Any]:
         tab = self.session.create_tab()
@@ -484,7 +529,10 @@ class SurfboardAPI:
             }
         return {"error": "Cannot close last tab"}
 
-    def _refresh(self) -> dict[str, Any]:
+    def _refresh(self, tab_id: int | None = None) -> dict[str, Any]:
+        if tab_id is not None:
+            if not self.session.switch_tab(tab_id):
+                return {"error": f"No tab with ID {tab_id}"}
         tab = self.session.active_tab
         if tab and tab.url and tab.url != "about:blank":
             return self._navigate(tab.url, tab_id=tab.id)
@@ -588,7 +636,7 @@ def _find_section(sections, section_id: int):
     return None
 
 
-def run_server() -> None:
+if __name__ == "__main__":
     api = SurfboardAPI()
     print("Surfboard API ready", flush=True)
     for line in sys.stdin:
@@ -604,7 +652,3 @@ def run_server() -> None:
         except Exception as e:
             print(json.dumps({"error": str(e)}), flush=True)
     api.close()
-
-
-if __name__ == "__main__":
-    run_server()

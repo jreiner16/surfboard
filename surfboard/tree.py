@@ -6,9 +6,8 @@ from bs4 import BeautifulSoup, Tag
 from surfboard.cleaner import clean_html
 from surfboard.models import Element, ElementType, Page, Section
 
-SECTION_CHAR_LIMIT = 3000
-CHUNK_SIZE = 600
-CHUNK_LINES = 8
+SECTION_CHAR_LIMIT = 5000
+PREVIEW_CHARS = 800
 
 
 def build_page(html: str, url: str, final_url: str) -> Page:
@@ -126,8 +125,6 @@ def _build_sections(
             sections.append(section)
 
     _assign_elements_to_sections(sections, elements, soup)
-    for section in sections:
-        _chunk_content_into_subsections(section, section_id_gen)
     _mark_collapsed(sections, section_id_gen)
 
     return sections, elements
@@ -167,13 +164,17 @@ def _assign_elements_to_sections(
 
         while heading_idx + 1 < len(headings):
             nxt = headings[heading_idx + 1]
-            if (hasattr(nxt, "sourceline") and hasattr(el_tag, "sourceline")
-                    and nxt.sourceline < el_tag.sourceline):
-                heading_idx += 1
-            elif (hasattr(nxt, "sourceline") and hasattr(el_tag, "sourceline")
-                  and nxt.sourceline == el_tag.sourceline
-                  and nxt.sourcepos < el_tag.sourcepos):
-                heading_idx += 1
+            nxt_line = getattr(nxt, "sourceline", None)
+            el_line = getattr(el_tag, "sourceline", None)
+            nxt_pos = getattr(nxt, "sourcepos", None)
+            el_pos = getattr(el_tag, "sourcepos", None)
+            if nxt_line is not None and el_line is not None:
+                if nxt_line < el_line:
+                    heading_idx += 1
+                elif nxt_line == el_line and nxt_pos is not None and el_pos is not None and nxt_pos < el_pos:
+                    heading_idx += 1
+                else:
+                    break
             else:
                 break
 
@@ -198,9 +199,6 @@ def _assign_elements_to_sections(
                 break
 
 
-PREVIEW_CHARS = 300
-
-
 def _mark_collapsed(sections: list[Section], counter: Iterator[int], depth: int = 0) -> None:
     for section in sections:
         if section.subsections:
@@ -221,33 +219,6 @@ def _mark_collapsed(sections: list[Section], counter: Iterator[int], depth: int 
             section.subsections.append(more)
         else:
             section.collapsed = False
-
-
-def _chunk_content_into_subsections(section: Section, counter: Iterator[int]) -> None:
-    """If a section has long content and no subsections, split content into chunk subsections."""
-    for sub in section.subsections:
-        _chunk_content_into_subsections(sub, counter)
-
-    if section.subsections:
-        return  # already has real subsections, don't chunk
-
-    lines = [l for l in section.content.splitlines() if l.strip()] if section.content else []
-    if len(lines) <= CHUNK_LINES:
-        return  # short enough, no need to chunk
-
-    chunks: list[list[str]] = []
-    for i in range(0, len(lines), CHUNK_LINES):
-        chunks.append(lines[i:i + CHUNK_LINES])
-
-    section.content = ""
-    for i, chunk in enumerate(chunks):
-        sub = Section(
-            title=f"Part {i + 1}",
-            level=section.level + 1,
-            content="\n".join(chunk),
-            section_id=next(counter),
-        )
-        section.subsections.append(sub)
 
 
 def _truncate_text(text: str, limit: int = SECTION_CHAR_LIMIT) -> str:
