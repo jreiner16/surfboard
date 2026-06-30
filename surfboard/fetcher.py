@@ -18,11 +18,21 @@ _BOT_BLOCK_PHRASES = [
     "checking your browser",
     "ddos-guard",
     "please stand by",
+    "unexpected error",
+    "automated access",
+    "automated queries",
+    "too many requests",
+    "please try again later",
+    "sorry, you have been blocked",
+    "you have been blocked",
+    "our systems have detected",
+    "suspicious activity",
+    "we need to make sure you're not a robot",
 ]
 
 
 def _is_bot_block(html: str, status_code: int) -> bool:
-    if status_code in (403, 429, 503):
+    if status_code in (403, 418, 429, 503):
         return True
     lower = html[:4000].lower()
     return any(phrase in lower for phrase in _BOT_BLOCK_PHRASES)

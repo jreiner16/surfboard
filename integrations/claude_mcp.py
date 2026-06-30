@@ -68,7 +68,7 @@ class SurfboardMCPServer:
                     "properties": {
                         "id": {"type": "integer", "description": "The element ID to click"},
                         "tab_id": {"type": "integer", "description": "Tab to operate on (from browse result)"},
-                        "minimal": {"type": "boolean", "description": "Skip fetching the updated page (default: false)"},
+                        "minimal": {"type": "boolean", "description": "Skip returning the full page (default: true)"},
                     },
                     "required": ["id"],
                 },
@@ -115,7 +115,7 @@ class SurfboardMCPServer:
                     "properties": {
                         "id": {"type": "integer", "description": "The section ID to expand"},
                         "tab_id": {"type": "integer", "description": "Tab to operate on (from browse result)"},
-                        "minimal": {"type": "boolean", "description": "Skip returning the full page (default: false)"},
+                        "minimal": {"type": "boolean", "description": "Skip returning the full page (default: true)"},
                     },
                     "required": ["id"],
                 },
@@ -128,7 +128,7 @@ class SurfboardMCPServer:
                     "properties": {
                         "id": {"type": "integer", "description": "The section ID to collapse"},
                         "tab_id": {"type": "integer", "description": "Tab to operate on (from browse result)"},
-                        "minimal": {"type": "boolean", "description": "Skip returning the full page (default: false)"},
+                        "minimal": {"type": "boolean", "description": "Skip returning the full page (default: true)"},
                     },
                     "required": ["id"],
                 },
@@ -344,6 +344,21 @@ class SurfboardMCPServer:
                     "required": ["selector"],
                 },
             },
+            {
+                "name": "get_console_logs",
+                "description": "Get accumulated browser console logs (useful for debugging JS errors)",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "tab_id": {"type": "integer", "description": "Tab to operate on"},
+                    },
+                },
+            },
+            {
+                "name": "clear_cookies",
+                "description": "Clear all browser cookies, including persisted session cookies",
+                "inputSchema": {"type": "object", "properties": {}},
+            },
         ]
 
         return {
@@ -364,7 +379,7 @@ class SurfboardMCPServer:
             result = self.api._navigate(url, tab_id=args.get("tab_id"))
         elif name == "click":
             eid = args.get("id", 0)
-            result = self.api._click(str(eid), tab_id=args.get("tab_id"), minimal=args.get("minimal", False))
+            result = self.api._click(str(eid), tab_id=args.get("tab_id"), minimal=args.get("minimal"))
         elif name == "fill":
             result = self.api._fill(args.get("id", 0), args.get("text", ""), tab_id=args.get("tab_id"))
         elif name == "search":
@@ -373,9 +388,9 @@ class SurfboardMCPServer:
         elif name == "get_page":
             result = self.api._get_page(tab_id=args.get("tab_id"))
         elif name == "expand":
-            result = self.api._expand(args.get("id", 0), tab_id=args.get("tab_id"), minimal=args.get("minimal", False))
+            result = self.api._expand(args.get("id", 0), tab_id=args.get("tab_id"), minimal=args.get("minimal"))
         elif name == "collapse":
-            result = self.api._collapse(args.get("id", 0), tab_id=args.get("tab_id"), minimal=args.get("minimal", False))
+            result = self.api._collapse(args.get("id", 0), tab_id=args.get("tab_id"), minimal=args.get("minimal"))
         elif name == "back":
             result = self.api._back()
         elif name == "forward":
@@ -385,7 +400,7 @@ class SurfboardMCPServer:
         elif name == "tab_switch":
             result = self.api._tab_switch(args.get("id", 0))
         elif name == "tab_close":
-            result = self.api._tab_close()
+            result = self.api._tab_close(tab_id=args.get("tab_id"))
         elif name == "refresh":
             result = self.api._refresh()
         elif name == "status":
@@ -418,6 +433,10 @@ class SurfboardMCPServer:
             result = self.api._highlight(args.get("ids", []), tab_id=args.get("tab_id"))
         elif name == "get_section":
             result = self.api._get_section(args.get("id", 0), tab_id=args.get("tab_id"))
+        elif name == "get_console_logs":
+            result = {"logs": self.api.fetcher.get_console_logs()}
+        elif name == "clear_cookies":
+            result = self.api._clear_cookies()
         else:
             return {
                 "jsonrpc": "2.0",
@@ -444,7 +463,7 @@ class SurfboardMCPServer:
                 {"type": "text", "text": "Screenshot captured"},
                 {"type": "image", "data": result["screenshot_base64"], "mimeType": "image/png"},
             ]
-        return [{"type": "text", "text": json.dumps(result, indent=2)}]
+        return [{"type": "text", "text": json.dumps(result, indent=None, separators=(",", ":"))}]
 
     def run(self) -> None:
         for line in sys.stdin:

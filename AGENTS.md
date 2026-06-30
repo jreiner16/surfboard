@@ -8,7 +8,7 @@ When you need to browse the web, search, or fetch live content, use the `surfboa
 
 - `surfboard_search` — Search the web via Google. Pass `query` string.
 - `surfboard_browse` — Navigate to a URL. Pass `url` string.
-- `surfboard_click` — Click an element by its ID number. Pass `id` integer. Navigates on links, triggers actions on buttons.
+- `surfboard_click` — Click an element by its ID number. Pass `id` integer. Navigates on links, triggers actions on buttons. Default `minimal=true` (omit page structure from response).
 - `surfboard_get_page` — Get the current page content (sections, elements, links).
 - `surfboard_back` / `surfboard_forward` — Navigate history.
 - `surfboard_tab_new` / `surfboard_tab_switch` — Tab management.

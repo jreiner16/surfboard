@@ -206,7 +206,8 @@ class SurfboardAPI:
 
         # Use specified tab, or reuse the active tab (create one only if none exists)
         if tab_id is not None:
-            self.session.switch_tab(tab_id)
+            if not self.session.switch_tab(tab_id):
+                return {"error": f"No tab with ID {tab_id}"}
             tab = self.session.active_tab
         else:
             tab = self.session.active_tab
@@ -246,7 +247,54 @@ class SurfboardAPI:
             return f"a[href={_css_quote(el.href)}]"
         return tag
 
-    def _click(self, target: str, tab_id: int | None = None, minimal: bool = False) -> dict[str, Any]:
+    def _build_fallback_selectors(self, el) -> list[str]:
+        """Generate alternative selectors for hard-to-click elements."""
+        fallbacks = []
+        tag = "div"
+        if el.type == ElementType.BUTTON:
+            tag = "button"
+        elif el.type == ElementType.TEXT_INPUT:
+            tag = "input"
+        elif el.type == ElementType.TEXTAREA:
+            tag = "textarea"
+
+        # Try aria-label
+        if el.attributes.get("aria-label"):
+            fallbacks.append(f"{tag}[aria-label={_css_quote(el.attributes['aria-label'])}]")
+
+        # Try title attribute
+        if el.attributes.get("title"):
+            fallbacks.append(f"{tag}[title={_css_quote(el.attributes['title'])}]")
+
+        # Try class-based selector (first class)
+        el_class = el.attributes.get("class", "")
+        if el_class:
+            classes = el_class.strip().split()
+            if classes:
+                class_sel = "".join(f".{c}" for c in classes[:2])
+                fallbacks.append(f"{tag}{class_sel}")
+
+        # Try role attribute
+        if el.attributes.get("role"):
+            fallbacks.append(f"{tag}[role={_css_quote(el.attributes['role'])}]")
+
+        # Try visible text content for buttons/links
+        if el.text and el.type in (ElementType.BUTTON, ElementType.LINK):
+            text = el.text.strip()[:50]
+            if text:
+                fallbacks.append(f"{tag}:has-text({_css_quote(text)})")
+
+        # Last resort: click by element text
+        if el.text and el.type == ElementType.BUTTON:
+            text = el.text.strip()[:30]
+            if text:
+                fallbacks.append(f"text={text}")
+
+        return fallbacks
+
+    def _click(self, target: str, tab_id: int | None = None, minimal: bool | None = None) -> dict[str, Any]:
+        if minimal is None:
+            minimal = True
         if tab_id is not None:
             self.session.switch_tab(tab_id)
         tab = self.session.active_tab
@@ -263,9 +311,10 @@ class SurfboardAPI:
                 return self._navigate(el.href, tab_id=tab.id)
 
             selector = self._build_selector(el)
-            click_result = self.fetcher.click(selector)
+            fallbacks = self._build_fallback_selectors(el)
+            click_result = self.fetcher.click(selector, fallback_selectors=fallbacks)
             if "error" in click_result:
-                return click_result
+                return {**click_result, "element_id": eid, "hint": "The page DOM may have changed. Use get_page() to refresh."}
             self.fetcher.wait_for_load(timeout_ms=1000)
             html = self.fetcher.content()
             url = self.fetcher.current_url() or tab.url
@@ -274,7 +323,7 @@ class SurfboardAPI:
                 tab.page = build_page(html, tab.url, url)
             elif html:
                 tab.url = url
-            result: dict[str, Any] = {"clicked": el.id, "type": el.type.value, "label": el.label, "selector": selector}
+            result: dict[str, Any] = {"clicked": el.id, "type": el.type.value, "label": el.label, "selector": click_result.get("selector_used", selector)}
             if not minimal and tab and tab.page:
                 result["page"] = _page_to_dict(tab.page)
             return result
@@ -353,21 +402,42 @@ class SurfboardAPI:
             return result
         if tab_id is not None:
             self.session.switch_tab(tab_id)
-        try:
-            press = self.fetcher.press_key("Enter")
-            if "error" in press:
-                result["submitted"] = False
-                result["submit_error"] = press["error"]
-                result["element_id"] = element_id
-            else:
-                result["submitted"] = True
-                url = self.fetcher.evaluate("window.location.href")
-                if not url.startswith("error"):
-                    result["url_after"] = url
-        except Exception as e:
+
+        tab = self.session.active_tab
+        el = tab.page.element_by_id(element_id) if tab and tab.page else None
+        selector = self._build_selector(el) if el else None
+
+        submit_result = self.fetcher.submit_form(selector)
+        if "error" in submit_result:
             result["submitted"] = False
-            result["submit_error"] = f"element #{element_id}: {e}"
+            result["submit_error"] = submit_result["error"]
             result["element_id"] = element_id
+        else:
+            # Wait a moment for the page to respond
+            import time
+            time.sleep(0.5)
+            try:
+                self.fetcher.wait_for_load(timeout_ms=2000)
+            except Exception:
+                pass
+            result["submitted"] = True
+            result["strategy"] = submit_result.get("strategy")
+            url = self.fetcher.evaluate("window.location.href")
+            if not url.startswith("error"):
+                result["url_after"] = url
+            # Update tab page if navigation happened
+            try:
+                html = self.fetcher.content()
+                if html:
+                    current_url = self.fetcher.current_url() or tab.url
+                    if current_url != tab.url:
+                        from surfboard.tree import build_page
+                        tab.url = current_url
+                        tab.page = build_page(html, current_url, current_url)
+                        tab.push_url(current_url)
+                        result["page"] = _page_to_dict(tab.page)
+            except Exception:
+                pass
         return result
 
     def _evaluate(self, js_code: str, tab_id: int | None = None) -> dict[str, Any]:
@@ -429,6 +499,18 @@ class SurfboardAPI:
         url = f"https://www.google.com/search?q={urllib.parse.quote(query)}&udm=14"
         return self._navigate(url)
 
+    def _clear_cookies(self) -> dict[str, Any]:
+        """Clear all cookies for the current browser context."""
+        try:
+            self.fetcher._context.clear_cookies()
+            # Also clear the saved cookie file
+            cookie_path = self.fetcher._cookie_path()
+            if cookie_path.exists():
+                cookie_path.unlink()
+            return {"cleared": True}
+        except Exception as e:
+            return {"error": str(e)}
+
     def _back(self) -> dict[str, Any]:
         tab = self.session.active_tab
         if tab and tab.can_go_back():
@@ -456,10 +538,19 @@ class SurfboardAPI:
             return {"tab_id": tab_id}
         return {"error": f"No tab with ID {tab_id}"}
 
-    def _tab_close(self) -> dict[str, Any]:
+    def _tab_close(self, tab_id: int | None = None) -> dict[str, Any]:
+        if tab_id is not None:
+            if not self.session.switch_tab(tab_id):
+                return {"error": f"No tab with ID {tab_id}"}
         tab = self.session.active_tab
         if tab and self.session.close_tab(tab.id):
-            return {"tab_id": tab.id, "closed": True}
+            new_active = self.session.active_tab
+            return {
+                "tab_id": tab.id,
+                "closed": True,
+                "active_tab_id": new_active.id if new_active else None,
+                "tabs": len(self.session.tabs),
+            }
         return {"error": "Cannot close last tab"}
 
     def _refresh(self) -> dict[str, Any]:
@@ -476,7 +567,9 @@ class SurfboardAPI:
             return {"tab_id": tab.id, "page": _page_to_dict(tab.page)}
         return {"page": None}
 
-    def _expand(self, section_id: int, tab_id: int | None = None, minimal: bool = False) -> dict[str, Any]:
+    def _expand(self, section_id: int, tab_id: int | None = None, minimal: bool | None = None) -> dict[str, Any]:
+        if minimal is None:
+            minimal = True
         if tab_id is not None:
             self.session.switch_tab(tab_id)
         tab = self.session.active_tab
@@ -491,7 +584,9 @@ class SurfboardAPI:
             result["page"] = _page_to_dict(tab.page)
         return result
 
-    def _collapse(self, section_id: int, tab_id: int | None = None, minimal: bool = False) -> dict[str, Any]:
+    def _collapse(self, section_id: int, tab_id: int | None = None, minimal: bool | None = None) -> dict[str, Any]:
+        if minimal is None:
+            minimal = True
         if tab_id is not None:
             self.session.switch_tab(tab_id)
         tab = self.session.active_tab
@@ -536,13 +631,17 @@ class SurfboardAPI:
 
     def _status(self) -> dict[str, Any]:
         tab = self.session.active_tab
-        return {
+        logs = self.fetcher.peek_console_logs()
+        result = {
             "tabs": len(self.session.tabs),
             "active_tab": self.session.active_tab_id,
             "current_url": tab.url if tab else None,
             "can_go_back": tab.can_go_back() if tab else False,
             "can_go_forward": tab.can_go_forward() if tab else False,
         }
+        if logs:
+            result["console_logs"] = logs
+        return result
 
     def close(self) -> None:
         self.fetcher.close()
@@ -559,35 +658,43 @@ def _find_section(sections, section_id: int):
 
 
 def _page_to_dict(page) -> dict[str, Any]:
-    d: dict[str, Any] = {"url": page.url, "title": page.title}
+    d: dict[str, Any] = {"u": page.url, "t": page.title}
     if page.description:
-        d["description"] = page.description
-    d["sections"] = [_section_to_dict(s) for s in page.sections]
-    d["elements"] = [_element_to_dict(e) for e in page.elements]
+        d["d"] = page.description
+    d["s"] = [_section_to_dict(s) for s in page.sections]
+    d["e"] = [_element_to_dict(e) for e in page.elements]
     return d
 
 
 def _section_to_dict(section) -> dict[str, Any]:
-    d: dict[str, Any] = {"id": section.section_id, "title": section.title, "level": section.level, "collapsed": section.collapsed}
+    d: dict[str, Any] = {"i": section.section_id, "t": section.title, "l": section.level}
+    if section.collapsed:
+        d["c"] = True
     if not section.collapsed and section.content:
-        d["content"] = section.content
+        d["ct"] = section.content
     if section.subsections:
-        d["subsections"] = [_section_to_dict(s) for s in section.subsections]
+        d["ss"] = [_section_to_dict(s) for s in section.subsections]
     return d
 
 
+_ELEMENT_LABEL_MAX = 80
+
+
 def _element_to_dict(el) -> dict[str, Any]:
-    d: dict[str, Any] = {"id": el.id, "type": el.type.value}
+    d: dict[str, Any] = {"i": el.id, "t": el.type.value}
     if el.label:
-        d["label"] = el.label
+        label = el.label
+        if len(label) > _ELEMENT_LABEL_MAX:
+            label = label[:_ELEMENT_LABEL_MAX].rsplit(" ", 1)[0] + "…"
+        d["l"] = label
     if el.href:
-        d["href"] = el.href
+        d["h"] = el.href
     if el.name:
-        d["name"] = el.name
+        d["n"] = el.name
     if el.placeholder:
-        d["placeholder"] = el.placeholder
+        d["p"] = el.placeholder
     if el.value:
-        d["value"] = el.value
+        d["v"] = el.value
     return d
 
 

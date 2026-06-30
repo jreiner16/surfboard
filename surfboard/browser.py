@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 
 from surfboard.fetcher import FetchResult, _is_bot_block
 
@@ -10,6 +12,70 @@ PLAYWRIGHT_UA = (
     "Chrome/128.0.0.0 Safari/537.36"
 )
 
+_STEALTH_INIT_SCRIPT = """
+// Remove webdriver property
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+// Chrome plugins
+Object.defineProperty(navigator, 'plugins', {
+    get: () => [1, 2, 3, 4, 5],
+});
+
+// Languages
+Object.defineProperty(navigator, 'languages', {
+    get: () => ['en-US', 'en'],
+});
+
+// Chrome runtime
+window.chrome = {
+    runtime: {},
+    loadTimes: function() {},
+    csi: function() {},
+    app: {},
+};
+
+// Permissions
+navigator.permissions.query = (() => {
+    const original = navigator.permissions.query.bind(navigator.permissions);
+    return (params) => {
+        if (params.name === 'notifications') {
+            return Promise.resolve({ state: 'denied', onchange: null });
+        }
+        return original(params);
+    };
+})();
+
+// WebGL vendor
+const getExt = HTMLCanvasElement.prototype.getContext;
+HTMLCanvasElement.prototype.getContext = function(type, ...args) {
+    const ctx = getExt.call(this, type, ...args);
+    if (ctx && type === 'webgl') {
+        const getParam = ctx.getParameter;
+        ctx.getParameter = function(param) {
+            if (param === 37445) return 'Intel Inc.';
+            if (param === 37446) return 'Intel Iris OpenGL Engine';
+            return getParam.call(this, param);
+        };
+    }
+    return ctx;
+};
+
+// Remove headless chrome detection
+Object.defineProperty(navigator, 'connection', {
+    get: () => ({ rtt: 100, effectiveType: '4g' }),
+});
+
+// Fake device memory
+Object.defineProperty(navigator, 'deviceMemory', {
+    get: () => 8,
+});
+
+// Fake hardware concurrency
+Object.defineProperty(navigator, 'hardwareConcurrency', {
+    get: () => 8,
+});
+"""
+
 
 class BrowserFetcher:
     def __init__(self, timeout: float = 15.0):
@@ -18,6 +84,7 @@ class BrowserFetcher:
         self._browser = None
         self._context = None
         self._page = None
+        self._console_logs: list[str] = []
 
     def _start(self):
         from playwright.sync_api import sync_playwright
@@ -28,6 +95,7 @@ class BrowserFetcher:
                 "--no-sandbox",
                 "--disable-blink-features=AutomationControlled",
                 "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-component-update",
             ],
         )
         self._context = self._browser.new_context(
@@ -38,12 +106,44 @@ class BrowserFetcher:
             timezone_id="America/New_York",
         )
         self._page = self._context.new_page()
-        self._page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-        """)
+        self._page.add_init_script(_STEALTH_INIT_SCRIPT)
+
+        # Capture console logs
+        self._console_logs = []
+        self._page.on("console", lambda msg: self._console_logs.append(f"[{msg.type}] {msg.text}"))
+
         self._ensure_clipboard_permissions()
+        self._restore_cookies()
+
+    def get_console_logs(self) -> list[str]:
+        logs = list(self._console_logs)
+        self._console_logs = []
+        return logs
+
+    def peek_console_logs(self) -> list[str]:
+        return list(self._console_logs)
+
+    def _cookie_path(self) -> Path:
+        return Path.home() / ".surfboard" / "cookies.json"
+
+    def _save_cookies(self):
+        try:
+            cookies = self._context.cookies()
+            path = self._cookie_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(cookies, indent=2))
+        except Exception:
+            pass
+
+    def _restore_cookies(self):
+        try:
+            path = self._cookie_path()
+            if path.exists():
+                cookies = json.loads(path.read_text())
+                if cookies:
+                    self._context.add_cookies(cookies)
+        except Exception:
+            pass
 
     def fetch(self, url: str) -> FetchResult:
         if not self._page:
@@ -71,6 +171,7 @@ class BrowserFetcher:
                 )
 
             html = self._page.content()
+            self._save_cookies()
             return FetchResult(
                 url=url, html=html, status_code=200, headers={}, final_url=self._page.url,
             )
@@ -85,9 +186,17 @@ class BrowserFetcher:
             return "error: no page loaded"
         try:
             result = self._page.evaluate(js_code)
-            return str(result) if result is not None else "null"
+            logs = self.get_console_logs()
+            output = str(result) if result is not None else "null"
+            if logs:
+                output += "\n[console]\n" + "\n".join(logs)
+            return output
         except Exception as e:
-            return f"error: {e}"
+            logs = self.get_console_logs()
+            msg = f"error: {e}"
+            if logs:
+                msg += "\n[console]\n" + "\n".join(logs)
+            return msg
 
     def get_full_text(self) -> str:
         if not self._page:
@@ -133,14 +242,36 @@ class BrowserFetcher:
         except Exception as e:
             return {"error": str(e)}
 
-    def click(self, selector: str) -> dict:
+    def _scroll_into_view(self, selector: str) -> None:
+        try:
+            self._page.evaluate(f"""() => {{
+                const el = document.querySelector({json.dumps(selector)});
+                if (el) el.scrollIntoView({{block: 'center', behavior: 'instant'}});
+            }}""")
+            self._page.wait_for_timeout(200)
+        except Exception:
+            pass
+
+    def click(self, selector: str, fallback_selectors: list[str] | None = None) -> dict:
         if not self._page:
             return {"error": "no page loaded"}
-        try:
-            self._page.click(selector)
-            return {"clicked": selector}
-        except Exception as e:
-            return {"error": str(e)}
+        selectors_to_try = [selector]
+        if fallback_selectors:
+            selectors_to_try.extend(fallback_selectors)
+
+        last_error = None
+        for sel in selectors_to_try:
+            try:
+                el = self._page.query_selector(sel)
+                if el:
+                    self._scroll_into_view(sel)
+                    self._page.click(sel)
+                    return {"clicked": sel, "selector_used": sel}
+            except Exception as e:
+                last_error = str(e)
+                continue
+
+        return {"error": f"click failed for all selectors: {last_error}"}
 
     def hover(self, selector: str) -> dict:
         if not self._page:
@@ -189,6 +320,7 @@ class BrowserFetcher:
         if not self._page:
             return {"error": "no page loaded"}
         try:
+            self._scroll_into_view(selector)
             # Playwright fill() triggers real input events (works for most frameworks)
             self._page.fill(selector, text)
             # Additionally fire synthetic input+change for frameworks that use addEventListener
@@ -207,7 +339,23 @@ class BrowserFetcher:
         if not self._page:
             return {"error": "no page loaded"}
         try:
-            self._page.keyboard.press(key)
+            # Support key combos: "Ctrl+C", "Shift+Enter", "Ctrl+Shift+F", etc.
+            if "+" in key:
+                parts = key.split("+")
+                # All but the last are modifiers, the last is the actual key
+                modifiers = parts[:-1]
+                actual_key = parts[-1]
+                # Map common modifier names
+                mod_map = {"ctrl": "Control", "shift": "Shift", "alt": "Alt", "meta": "Meta"}
+                for mod in modifiers:
+                    mapped = mod_map.get(mod.lower(), mod)
+                    self._page.keyboard.down(mapped)
+                self._page.keyboard.press(actual_key)
+                for mod in modifiers:
+                    mapped = mod_map.get(mod.lower(), mod)
+                    self._page.keyboard.up(mapped)
+            else:
+                self._page.keyboard.press(key)
             return {"pressed": key}
         except Exception as e:
             return {"error": str(e)}
@@ -308,6 +456,74 @@ class BrowserFetcher:
             return {"found": True, "selector": selector, "timeout_ms": timeout_ms}
         except Exception as e:
             return {"error": str(e)}
+
+    def submit_form(self, selector: str) -> dict:
+        """Smart form submission with multiple fallback strategies."""
+        if not self._page:
+            return {"error": "no page loaded"}
+        strategies = []
+
+        # Strategy 1: Press Enter on the focused element
+        strategies.append(("Enter key", lambda: self._page.keyboard.press("Enter")))
+
+        # Strategy 2: Find and click any submit button in the form
+        strategies.append(("submit button", lambda: self._page.evaluate(f"""() => {{
+            const el = document.querySelector({json.dumps(selector)});
+            if (!el) return false;
+            const form = el.closest('form');
+            if (!form) return false;
+            const btn = form.querySelector('button[type=submit], input[type=submit], button:has(svg), button[aria-label*=search i], button:last-of-type');
+            if (btn) {{ btn.click(); return true; }}
+            return false;
+        }}""")))
+
+        # Strategy 3: JS form.submit()
+        strategies.append(("form.submit()", lambda: self._page.evaluate(f"""() => {{
+            const el = document.querySelector({json.dumps(selector)});
+            if (!el) return false;
+            const form = el.closest('form');
+            if (form) {{ form.submit(); return true; }}
+            return false;
+        }}""")))
+
+        # Strategy 4: Dispatch submit event on form
+        strategies.append(("submit event", lambda: self._page.evaluate(f"""() => {{
+            const el = document.querySelector({json.dumps(selector)});
+            if (!el) return false;
+            const form = el.closest('form');
+            if (form) {{
+                form.dispatchEvent(new Event('submit', {{ bubbles: true, cancelable: true }}));
+                return true;
+            }}
+            return false;
+        }}""")))
+
+        # Strategy 5: Click any nearby button
+        strategies.append(("nearby button", lambda: self._page.evaluate(f"""() => {{
+            const el = document.querySelector({json.dumps(selector)});
+            if (!el) return false;
+            const form = el.closest('form');
+            if (form) {{
+                const btns = form.querySelectorAll('button');
+                if (btns.length > 0) {{ btns[0].click(); return true; }}
+            }}
+            const parent = el.parentElement;
+            if (parent) {{
+                const btn = parent.querySelector('button, input[type=submit]');
+                if (btn) {{ btn.click(); return true; }}
+            }}
+            return false;
+        }}""")))
+
+        for name, strategy in strategies:
+            try:
+                result = strategy()
+                if result is not False and result is not None:
+                    return {"submitted": True, "strategy": name}
+            except Exception:
+                continue
+
+        return {"error": "all form submission strategies failed"}
 
     def close(self):
         try:
