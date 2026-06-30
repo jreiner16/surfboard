@@ -17,26 +17,6 @@ class ElementType(str, Enum):
     HEADING = "heading"
 
 
-class Intent(str, Enum):
-    NAVIGATE = "navigate"
-    CLICK = "click"
-    SEARCH = "search"
-    BACK = "back"
-    FORWARD = "forward"
-    SCROLL = "scroll"
-    TAB_NEW = "tab_new"
-    TAB_SWITCH = "tab_switch"
-    TAB_CLOSE = "tab_close"
-    EXPAND = "expand"
-    COLLAPSE = "collapse"
-    FILL = "fill"
-    SUBMIT = "submit"
-    REFRESH = "refresh"
-    HELP = "help"
-    QUIT = "quit"
-    UNKNOWN = "unknown"
-
-
 @dataclass
 class Element:
     id: int
@@ -71,12 +51,6 @@ class Section:
     collapsed: bool = False
     collapsed_by_default: bool = False
     full_content: str = ""
-
-    def total_lines(self) -> int:
-        lines = len(self.content.splitlines()) if self.content else 0
-        for sub in self.subsections:
-            lines += sub.total_lines()
-        return lines
 
 
 @dataclass
@@ -132,45 +106,35 @@ class Tab:
 
 @dataclass
 class Session:
-    tabs: list[Tab] = field(default_factory=list)
+    _tabs: dict[int, Tab] = field(default_factory=dict)
     active_tab_id: int = 0
     next_tab_id: int = 1
 
     @property
+    def tabs(self) -> list[Tab]:
+        return list(self._tabs.values())
+
+    @property
     def active_tab(self) -> Optional[Tab]:
-        for t in self.tabs:
-            if t.id == self.active_tab_id:
-                return t
-        return None
+        return self._tabs.get(self.active_tab_id)
 
     def create_tab(self) -> Tab:
         tab = Tab(id=self.next_tab_id)
         self.next_tab_id += 1
-        self.tabs.append(tab)
+        self._tabs[tab.id] = tab
         self.active_tab_id = tab.id
         return tab
 
     def close_tab(self, tab_id: int) -> bool:
-        if len(self.tabs) <= 1:
+        if len(self._tabs) <= 1:
             return False
-        self.tabs = [t for t in self.tabs if t.id != tab_id]
-        if self.active_tab_id == tab_id and self.tabs:
-            self.active_tab_id = self.tabs[-1].id
+        del self._tabs[tab_id]
+        if self.active_tab_id == tab_id and self._tabs:
+            self.active_tab_id = list(self._tabs.keys())[-1]
         return True
 
     def switch_tab(self, tab_id: int) -> bool:
-        for t in self.tabs:
-            if t.id == tab_id:
-                self.active_tab_id = tab_id
-                return True
+        if tab_id in self._tabs:
+            self.active_tab_id = tab_id
+            return True
         return False
-
-
-@dataclass
-class Command:
-    intent: Intent
-    slots: dict[str, str] = field(default_factory=dict)
-    raw: str = ""
-
-    def slot(self, name: str, default: str = "") -> str:
-        return self.slots.get(name, default)

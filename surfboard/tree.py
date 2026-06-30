@@ -7,8 +7,8 @@ from surfboard.cleaner import clean_html
 from surfboard.models import Element, ElementType, Page, Section
 
 SECTION_CHAR_LIMIT = 3000
-CHUNK_SIZE = 600  # chars per content chunk subsection
-CHUNK_LINES = 8   # lines per content chunk subsection
+CHUNK_SIZE = 600
+CHUNK_LINES = 8
 
 
 def build_page(html: str, url: str, final_url: str) -> Page:
@@ -23,6 +23,7 @@ def build_page(html: str, url: str, final_url: str) -> Page:
         page.description = desc
 
     seen_ids: set[int] = set()
+    elements: list[Element] = []
     for raw in raw_elements:
         etype = ElementType(raw["type"])
         el = Element(
@@ -38,9 +39,12 @@ def build_page(html: str, url: str, final_url: str) -> Page:
         )
         if raw["id"] not in seen_ids:
             seen_ids.add(raw["id"])
-            page.elements.append(el)
+            elements.append(el)
 
-    sections, body_elements = _build_sections(soup, page.elements, text)
+    page.elements = elements
+
+    sections, _ = _build_sections(soup, elements, text)
+    _assign_elements_to_sections(sections, elements, soup)
     page.sections = sections
 
     if not sections and text.strip():
@@ -48,7 +52,7 @@ def build_page(html: str, url: str, final_url: str) -> Page:
             Section(
                 title="Page Content",
                 level=1,
-                content=_truncate_text(text),
+                content=text,
                 full_content=text,
                 elements=page.elements,
             )
@@ -102,8 +106,6 @@ def _build_sections(
             sibling = sibling.find_next_sibling()
 
         content = " ".join(content_parts)
-        if len(content) > SECTION_CHAR_LIMIT:
-            content = content[:SECTION_CHAR_LIMIT] + "..."
 
         section = Section(
             title=title,
@@ -134,8 +136,66 @@ def _build_sections(
 def _assign_elements_to_sections(
     sections: list[Section], elements: list[Element], soup: BeautifulSoup
 ) -> None:
-    for section in sections:
-        _assign_elements_to_sections(section.subsections, elements, soup)
+    if not elements or not sections:
+        return
+
+    section_by_title: dict[str, Section] = {}
+
+    def _walk(secs: list[Section]) -> None:
+        for s in secs:
+            if s.title:
+                section_by_title[s.title] = s
+            _walk(s.subsections)
+
+    _walk(sections)
+
+    headings = [
+        h for h in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"])
+        if h.get_text(strip=True)
+    ]
+    if not headings:
+        return
+
+    el_tags: list[Tag] = []
+    for selector in ("a[href]", "button", "input:not([type=hidden])", "textarea", "select"):
+        el_tags.extend(soup.select(selector))
+
+    heading_idx = 0
+    for el_tag in el_tags:
+        if heading_idx >= len(headings):
+            break
+
+        while heading_idx + 1 < len(headings):
+            nxt = headings[heading_idx + 1]
+            if (hasattr(nxt, "sourceline") and hasattr(el_tag, "sourceline")
+                    and nxt.sourceline < el_tag.sourceline):
+                heading_idx += 1
+            elif (hasattr(nxt, "sourceline") and hasattr(el_tag, "sourceline")
+                  and nxt.sourceline == el_tag.sourceline
+                  and nxt.sourcepos < el_tag.sourcepos):
+                heading_idx += 1
+            else:
+                break
+
+        heading_text = headings[heading_idx].get_text(strip=True)
+        section = section_by_title.get(heading_text)
+        if section is None:
+            continue
+
+        tag_text = el_tag.get_text(strip=True)
+        tag_href = el_tag.get("href", "") if el_tag.name == "a" else ""
+        tag_id = str(el_tag.get("id", ""))
+        tag_name = str(el_tag.get("name", ""))
+
+        for el in elements:
+            if (el.tag == el_tag.name
+                    and el.text == tag_text
+                    and (el.href or "") == tag_href
+                    and (el.attributes.get("id", "") == tag_id or not tag_id)
+                    and (el.name or "") == tag_name
+                    and el not in section.elements):
+                section.elements.append(el)
+                break
 
 
 PREVIEW_CHARS = 300

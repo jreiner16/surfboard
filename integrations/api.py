@@ -1,55 +1,26 @@
 from __future__ import annotations
 
+import base64
+import inspect
 import json
 import sys
+import time
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 from surfboard.browser import BrowserFetcher
 from surfboard.models import ElementType, Session
+from surfboard.serializers import page_to_dict, section_to_dict
 from surfboard.tree import build_page
 
-
-import re as _re
-
-_REDDIT_RE = _re.compile(r"https?://(?:www\.|old\.)?reddit\.com(/[^\s]*)")
-_MEDIUM_RE = _re.compile(r"https?://(?:www\.)?medium\.com(/[^\s]*)")
-_TWITTER_RE = _re.compile(r"https?://(?:www\.)?(?:twitter|x)\.com(/[^\s]*)")
-_AMP_RE = _re.compile(r"(https?://[^\s]+?)/amp/?$", _re.IGNORECASE)
+from integrations.url_rewrite import reddit_json_to_html, rewrite_url
 
 
 def _css_quote(value: str) -> str:
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
     return f'"{escaped}"'
-
-
-def _rewrite_url(url: str) -> tuple[str, str | None]:
-    """Return (rewritten_url, note). note is set if the URL was rewritten."""
-    # Reddit → JSON API (no CAPTCHA, structured data)
-    m = _REDDIT_RE.match(url)
-    if m:
-        path = m.group(1).rstrip("/")
-        if not path.endswith(".json"):
-            return f"https://www.reddit.com{path}.json?raw_json=1", "reddit-json"
-
-    # Twitter/X → nitter (no JS wall)
-    m = _TWITTER_RE.match(url)
-    if m:
-        return f"https://nitter.net{m.group(1)}", "nitter-mirror"
-
-    # Medium → scribe.rip mirror (no paywall/JS wall)
-    m = _MEDIUM_RE.match(url)
-    if m:
-        return f"https://scribe.rip{m.group(1)}", "scribe-mirror"
-
-    # AMP URLs → strip /amp suffix to get canonical page
-    m = _AMP_RE.match(url)
-    if m:
-        return m.group(1), "amp-stripped"
-
-    return url, None
-
 
 
 def _log(tool: str, detail: str, status: str = "ok") -> None:
@@ -60,122 +31,75 @@ def _log(tool: str, detail: str, status: str = "ok") -> None:
         f.write(json.dumps(entry) + "\n")
 
 
-def _reddit_json_to_html(raw: str, url: str) -> str:
-    """Convert Reddit JSON API response to simple HTML for build_page."""
-    try:
-        data = json.loads(raw)
-    except Exception:
-        return raw
-
-    parts: list[str] = []
-
-    def post_html(post: dict) -> str:
-        title = post.get("title", "")
-        author = post.get("author", "")
-        score = post.get("score", "")
-        selftext = post.get("selftext", "")
-        link = post.get("url", "")
-        permalink = "https://www.reddit.com" + post.get("permalink", "")
-        h = f"<h1><a href='{permalink}'>{title}</a></h1>"
-        h += f"<p>by u/{author} · {score} points</p>"
-        if selftext:
-            h += f"<p>{selftext}</p>"
-        elif link:
-            h += f"<p><a href='{link}'>{link}</a></p>"
-        return h
-
-    def comment_html(node: dict, depth: int = 0) -> str:
-        if node.get("kind") == "more":
-            return ""
-        d = node.get("data", node)
-        author = d.get("author", "[deleted]")
-        body = d.get("body", "")
-        score = d.get("score", "")
-        tag = f"h{min(depth + 2, 6)}"
-        h = f"<{tag}>u/{author} ({score} pts)</{tag}><p>{body}</p>"
-        replies = d.get("replies", {})
-        if isinstance(replies, dict):
-            for child in replies.get("data", {}).get("children", []):
-                h += comment_html(child, depth + 1)
-        return h
-
-    if isinstance(data, dict) and data.get("kind") == "Listing":
-        for child in data.get("data", {}).get("children", []):
-            parts.append(post_html(child.get("data", {})))
-    elif isinstance(data, list) and len(data) == 2:
-        for child in data[0].get("data", {}).get("children", []):
-            parts.append(post_html(child.get("data", {})))
-        parts.append("<h2>Comments</h2>")
-        for child in data[1].get("data", {}).get("children", []):
-            parts.append(comment_html(child))
-
-    return "<html><body>" + "\n".join(parts) + "</body></html>" if parts else raw
-
-
 class SurfboardAPI:
     def __init__(self) -> None:
         self.fetcher = BrowserFetcher()
         self.session = Session()
         self.session.create_tab()
 
-    def handle(self, request: dict[str, Any]) -> dict[str, Any]:
-        cmd = request.get("cmd", "")
-        params = request.get("params", {})
+    _HANDLERS: dict[str, tuple[str, list[str]]] = {}  # cmd -> (method_name, param_keys)
 
-        if cmd == "navigate" or cmd == "open":
-            return self._navigate(params.get("url", ""))
-        elif cmd == "click":
-            return self._click(params.get("id", "") or params.get("target", ""), minimal=params.get("minimal", False))
-        elif cmd == "search":
-            return self._search(params.get("query", ""))
-        elif cmd == "fill":
-            return self._fill(params.get("id", 0), params.get("text", ""), tab_id=params.get("tab_id"))
-        elif cmd == "hover":
-            return self._hover(params.get("id", 0), tab_id=params.get("tab_id"))
-        elif cmd == "scroll_to":
-            return self._scroll_to(params.get("id", 0), tab_id=params.get("tab_id"))
-        elif cmd == "scroll_by":
-            return self._scroll_by(params.get("x", 0), params.get("y", 0), tab_id=params.get("tab_id"))
-        elif cmd == "wait_for_load":
-            return self._wait_for_load(params.get("timeout_ms", 10000), tab_id=params.get("tab_id"))
-        elif cmd == "back":
-            return self._back()
-        elif cmd == "forward":
-            return self._forward()
-        elif cmd == "tab_new":
-            return self._tab_new()
-        elif cmd == "tab_switch":
-            return self._tab_switch(params.get("id", 0))
-        elif cmd == "tab_close":
-            return self._tab_close()
-        elif cmd == "refresh":
-            return self._refresh()
-        elif cmd == "page":
-            return self._get_page()
-        elif cmd == "status":
-            return self._status()
-        elif cmd == "evaluate":
-            return self._evaluate(params.get("js", ""), tab_id=params.get("tab_id"))
-        elif cmd == "get_full_text":
-            return self._get_full_text(tab_id=params.get("tab_id"))
-        elif cmd == "screenshot":
-            return self._screenshot(path=params.get("path"), tab_id=params.get("tab_id"))
-        elif cmd == "fill_and_submit":
-            return self._fill_and_submit(params.get("id", 0), params.get("text", ""), tab_id=params.get("tab_id"))
-        elif cmd == "press_key":
-            return self._press_key(params.get("key", ""), tab_id=params.get("tab_id"))
-        elif cmd == "clipboard_copy":
-            return self._clipboard_copy(params.get("text", ""), tab_id=params.get("tab_id"))
-        elif cmd == "clipboard_read":
-            return self._clipboard_read(tab_id=params.get("tab_id"))
-        elif cmd == "highlight":
-            return self._highlight(params.get("ids", []), tab_id=params.get("tab_id"))
-        else:
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+
+    _DISPATCH: dict[str, tuple[str, dict[str, Any]]] | None = None
+
+    def _get_dispatch(self) -> dict[str, tuple[str, dict[str, Any]]]:
+        if self._DISPATCH is not None:
+            return self._DISPATCH
+        dispatch = {
+            "navigate": ("_navigate", {"url": "", "tab_id": None, "push_history": True}),
+            "open": ("_navigate", {"url": "", "tab_id": None, "push_history": True}),
+            "click": ("_click", {"target": "", "tab_id": None, "minimal": True, "id": 0}),
+            "search": ("_search", {"query": ""}),
+            "fill": ("_fill", {"id": 0, "text": "", "tab_id": None}),
+            "fill_and_submit": ("_fill_and_submit", {"id": 0, "text": "", "tab_id": None}),
+            "hover": ("_hover", {"id": 0, "tab_id": None}),
+            "scroll_to": ("_scroll_to", {"id": 0, "tab_id": None}),
+            "scroll_by": ("_scroll_by", {"x": 0, "y": 0, "tab_id": None}),
+            "wait_for_load": ("_wait_for_load", {"timeout_ms": 10000, "tab_id": None}),
+            "wait_for_element": ("_wait_for_element", {"selector": "", "timeout_ms": 10000, "tab_id": None}),
+            "back": ("_back", {}),
+            "forward": ("_forward", {}),
+            "tab_new": ("_tab_new", {}),
+            "tab_switch": ("_tab_switch", {"id": 0}),
+            "tab_close": ("_tab_close", {"tab_id": None}),
+            "refresh": ("_refresh", {}),
+            "page": ("_get_page", {"tab_id": None}),
+            "get_page": ("_get_page", {"tab_id": None}),
+            "status": ("_status", {}),
+            "evaluate": ("_evaluate", {"js": "", "tab_id": None}),
+            "get_full_text": ("_get_full_text", {"tab_id": None}),
+            "screenshot": ("_screenshot", {"path": None, "tab_id": None}),
+            "press_key": ("_press_key", {"key": "", "tab_id": None}),
+            "clipboard_copy": ("_clipboard_copy", {"text": "", "tab_id": None}),
+            "clipboard_read": ("_clipboard_read", {"tab_id": None}),
+            "highlight": ("_highlight", {"ids": [], "tab_id": None}),
+            "get_section": ("_get_section", {"id": 0, "tab_id": None}),
+            "expand": ("_expand", {"id": 0, "tab_id": None, "minimal": True}),
+            "collapse": ("_collapse", {"id": 0, "tab_id": None, "minimal": True}),
+            "clear_cookies": ("_clear_cookies", {}),
+        }
+        SurfboardAPI._DISPATCH = dispatch
+        return dispatch
+
+    _PARAM_ALIASES = {"id": "target"}
+
+    def handle(self, request: dict[str, Any]) -> dict[str, Any]:
+        cmd = request.get("cmd", request.get("method", ""))
+        params = request.get("params", request.get("arguments", {})).copy()
+
+        for alias_from, alias_to in self._PARAM_ALIASES.items():
+            if alias_from in params and alias_to not in params:
+                params[alias_to] = params[alias_from]
+
+        dispatch = self._get_dispatch()
+        entry = dispatch.get(cmd)
+        if entry is None:
             return {
                 "error": f"Unknown command: {cmd!r}",
                 "hint": (
-                    "Use explicit tool calls instead of natural-language commands. "
-                    "Available actions: browse(url), search(query), click(id), "
+                    "Available: browse(url), search(query), click(id), "
                     "fill(id, text), fill_and_submit(id, text), hover(id), "
                     "scroll_to(id), scroll_by(x, y), wait_for_load(timeout_ms), "
                     "get_page(), get_full_text(), evaluate(js), back(), forward(), "
@@ -185,11 +109,22 @@ class SurfboardAPI:
                 ),
             }
 
+        method_name, param_spec = entry
+        kwargs = {}
+        for key, default in param_spec.items():
+            raw = params.get(key)
+            kwargs[key] = raw if raw is not None else default
+
+        method = getattr(self, method_name)
+        sig = inspect.signature(method)
+        filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
+        return method(**filtered)
+
     def _navigate(self, url: str, tab_id: int | None = None, push_history: bool = True) -> dict[str, Any]:
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
 
-        url, rewrite_note = _rewrite_url(url)
+        url, rewrite_note = rewrite_url(url)
 
         result = self.fetcher.fetch(url)
         if result.error:
@@ -197,7 +132,7 @@ class SurfboardAPI:
             return {"error": result.error}
 
         if rewrite_note == "reddit-json":
-            html = _reddit_json_to_html(result.html, result.final_url)
+            html = reddit_json_to_html(result.html, result.final_url)
         else:
             html = result.html
 
@@ -220,7 +155,7 @@ class SurfboardAPI:
             if push_history:
                 tab.push_url(result.final_url)
 
-        return {"tab_id": tab.id if tab else None, "page": _page_to_dict(page)}
+        return {"tab_id": tab.id if tab else None, "page": page_to_dict(page)}
 
     def _build_selector(self, el) -> str:
         tag = "div"
@@ -325,7 +260,7 @@ class SurfboardAPI:
                 tab.url = url
             result: dict[str, Any] = {"clicked": el.id, "type": el.type.value, "label": el.label, "selector": click_result.get("selector_used", selector)}
             if not minimal and tab and tab.page:
-                result["page"] = _page_to_dict(tab.page)
+                result["page"] = page_to_dict(tab.page)
             return result
 
         return {"error": f"Invalid target: {target}"}
@@ -414,7 +349,6 @@ class SurfboardAPI:
             result["element_id"] = element_id
         else:
             # Wait a moment for the page to respond
-            import time
             time.sleep(0.5)
             try:
                 self.fetcher.wait_for_load(timeout_ms=2000)
@@ -431,11 +365,10 @@ class SurfboardAPI:
                 if html:
                     current_url = self.fetcher.current_url() or tab.url
                     if current_url != tab.url:
-                        from surfboard.tree import build_page
                         tab.url = current_url
                         tab.page = build_page(html, current_url, current_url)
                         tab.push_url(current_url)
-                        result["page"] = _page_to_dict(tab.page)
+                        result["page"] = page_to_dict(tab.page)
             except Exception:
                 pass
         return result
@@ -468,7 +401,6 @@ class SurfboardAPI:
                 return {"error": "no page loaded"}
             if path:
                 return {"screenshot": path}
-            import base64
             return {"screenshot_base64": base64.b64encode(data).decode()}
         except Exception as e:
             return {"error": str(e)}
@@ -494,7 +426,6 @@ class SurfboardAPI:
         return self.fetcher.highlight_elements(eids)
 
     def _search(self, query: str) -> dict[str, Any]:
-        import urllib.parse
         _log("search", query)
         url = f"https://www.google.com/search?q={urllib.parse.quote(query)}&udm=14"
         return self._navigate(url)
@@ -564,7 +495,7 @@ class SurfboardAPI:
             self.session.switch_tab(tab_id)
         tab = self.session.active_tab
         if tab and tab.page:
-            return {"tab_id": tab.id, "page": _page_to_dict(tab.page)}
+            return {"tab_id": tab.id, "page": page_to_dict(tab.page)}
         return {"page": None}
 
     def _expand(self, section_id: int, tab_id: int | None = None, minimal: bool | None = None) -> dict[str, Any]:
@@ -581,7 +512,7 @@ class SurfboardAPI:
         section.collapsed = False
         result: dict[str, Any] = {"tab_id": tab.id, "expanded": section_id}
         if not minimal:
-            result["page"] = _page_to_dict(tab.page)
+            result["page"] = page_to_dict(tab.page)
         return result
 
     def _collapse(self, section_id: int, tab_id: int | None = None, minimal: bool | None = None) -> dict[str, Any]:
@@ -598,7 +529,7 @@ class SurfboardAPI:
         section.collapsed = True
         result: dict[str, Any] = {"tab_id": tab.id, "collapsed": section_id}
         if not minimal:
-            result["page"] = _page_to_dict(tab.page)
+            result["page"] = page_to_dict(tab.page)
         return result
 
     def _get_section(self, section_id: int, tab_id: int | None = None) -> dict[str, Any]:
@@ -610,7 +541,7 @@ class SurfboardAPI:
         section = _find_section(tab.page.sections, section_id)
         if not section:
             return {"error": f"No section with ID {section_id}"}
-        result = _section_to_dict(section)
+        result = section_to_dict(section)
         result["full_content"] = section.full_content or section.content or ""
         # Collect all subsection content recursively
         full_parts = [result["full_content"]]
@@ -655,47 +586,6 @@ def _find_section(sections, section_id: int):
         if found:
             return found
     return None
-
-
-def _page_to_dict(page) -> dict[str, Any]:
-    d: dict[str, Any] = {"u": page.url, "t": page.title}
-    if page.description:
-        d["d"] = page.description
-    d["s"] = [_section_to_dict(s) for s in page.sections]
-    d["e"] = [_element_to_dict(e) for e in page.elements]
-    return d
-
-
-def _section_to_dict(section) -> dict[str, Any]:
-    d: dict[str, Any] = {"i": section.section_id, "t": section.title, "l": section.level}
-    if section.collapsed:
-        d["c"] = True
-    if not section.collapsed and section.content:
-        d["ct"] = section.content
-    if section.subsections:
-        d["ss"] = [_section_to_dict(s) for s in section.subsections]
-    return d
-
-
-_ELEMENT_LABEL_MAX = 80
-
-
-def _element_to_dict(el) -> dict[str, Any]:
-    d: dict[str, Any] = {"i": el.id, "t": el.type.value}
-    if el.label:
-        label = el.label
-        if len(label) > _ELEMENT_LABEL_MAX:
-            label = label[:_ELEMENT_LABEL_MAX].rsplit(" ", 1)[0] + "…"
-        d["l"] = label
-    if el.href:
-        d["h"] = el.href
-    if el.name:
-        d["n"] = el.name
-    if el.placeholder:
-        d["p"] = el.placeholder
-    if el.value:
-        d["v"] = el.value
-    return d
 
 
 def run_server() -> None:

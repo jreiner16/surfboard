@@ -107,28 +107,4 @@ def _render_actions(page: Page, lines: list[str]) -> None:
         lines.append(f"  ... and {n_extra} more elements")
 
 
-def render_status_bar(tab: Tab) -> list[str]:
-    nav = ("<" if tab.can_go_back() else "-") + (" >" if tab.can_go_forward() else " -")
-    return [f"Tab {tab.id}/{len(tab.history) if tab.history else 1} {nav} {tab.url}"]
 
-
-def render_error(msg: str) -> str:
-    return f"Error: {msg}"
-
-
-def render_info(msg: str) -> str:
-    return f"{msg}"
-
-
-def render_help() -> list[str]:
-    return [
-        "Commands:",
-        "  open <url>              Navigate to a URL",
-        "  click <n>               Click element by ID (link or button)",
-        "  search <q>              Search the web via Google",
-        "  type <text> in <n>      Fill an input field by ID",
-        "  back / forward          Navigate history",
-        "  tab new / tab <n>       Tab management",
-        "  expand/collapse <n|all> Expand or collapse sections",
-        "  refresh / help / quit",
-    ]

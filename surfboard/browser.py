@@ -127,23 +127,17 @@ class BrowserFetcher:
         return Path.home() / ".surfboard" / "cookies.json"
 
     def _save_cookies(self):
-        try:
-            cookies = self._context.cookies()
-            path = self._cookie_path()
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(cookies, indent=2))
-        except Exception:
-            pass
+        cookies = self._context.cookies()
+        path = self._cookie_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(cookies, indent=2))
 
     def _restore_cookies(self):
-        try:
-            path = self._cookie_path()
-            if path.exists():
-                cookies = json.loads(path.read_text())
-                if cookies:
-                    self._context.add_cookies(cookies)
-        except Exception:
-            pass
+        path = self._cookie_path()
+        if path.exists():
+            cookies = json.loads(path.read_text())
+            if cookies:
+                self._context.add_cookies(cookies)
 
     def fetch(self, url: str) -> FetchResult:
         if not self._page:
@@ -525,15 +519,33 @@ class BrowserFetcher:
 
         return {"error": "all form submission strategies failed"}
 
+    def __enter__(self) -> BrowserFetcher:
+        return self
+
+    def __exit__(self, *args) -> None:
+        self.close()
+
     def close(self):
-        try:
-            if self._page:
+        exc = None
+        if self._page:
+            try:
                 self._page.close()
-            if self._context:
+            except Exception as e:
+                exc = e
+        if self._context:
+            try:
                 self._context.close()
-            if self._browser:
+            except Exception as e:
+                exc = e
+        if self._browser:
+            try:
                 self._browser.close()
-            if self._playwright:
+            except Exception as e:
+                exc = e
+        if self._playwright:
+            try:
                 self._playwright.stop()
-        except Exception:
-            pass
+            except Exception as e:
+                exc = e
+        if exc:
+            raise exc
