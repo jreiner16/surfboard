@@ -33,6 +33,41 @@ def _log(tool: str, detail: str, status: str = "ok") -> None:
         f.write(json.dumps(entry) + "\n")
 
 
+# Single source of truth for command dispatch
+COMMAND_DISPATCH: dict[str, tuple[str, dict[str, Any]]] = {
+    "browse": ("_navigate", {"url": "", "tab_id": None, "push_history": True}),
+    "click": ("_click", {"target": "", "tab_id": None, "minimal": True}),
+    "search": ("_search", {"query": ""}),
+    "fill": ("_fill", {"element_id": 0, "text": "", "tab_id": None}),
+    "fill_and_submit": ("_fill_and_submit", {"element_id": 0, "text": "", "tab_id": None}),
+    "hover": ("_hover", {"element_id": 0, "tab_id": None}),
+    "scroll_to": ("_scroll_to", {"element_id": 0, "tab_id": None}),
+    "scroll_by": ("_scroll_by", {"x": 0, "y": 0, "tab_id": None}),
+    "wait_for_load": ("_wait_for_load", {"timeout_ms": 10000, "tab_id": None}),
+    "wait_for_element": ("_wait_for_element", {"selector": "", "timeout_ms": 10000, "tab_id": None}),
+    "back": ("_back", {}),
+    "forward": ("_forward", {}),
+    "tab_new": ("_tab_new", {}),
+    "tab_switch": ("_tab_switch", {"tab_id": 0}),
+    "tab_close": ("_tab_close", {"tab_id": None}),
+    "refresh": ("_refresh", {"tab_id": None}),
+    "get_page": ("_get_page", {"tab_id": None}),
+    "status": ("_status", {}),
+    "evaluate": ("_evaluate", {"js_code": "", "tab_id": None}),
+    "get_full_text": ("_get_full_text", {"tab_id": None}),
+    "screenshot": ("_screenshot", {"path": None, "tab_id": None}),
+    "press_key": ("_press_key", {"key": "", "tab_id": None}),
+    "clipboard_copy": ("_clipboard_copy", {"text": "", "tab_id": None}),
+    "clipboard_read": ("_clipboard_read", {"tab_id": None}),
+    "highlight": ("_highlight", {"eids": [], "tab_id": None}),
+    "get_section": ("_get_section", {"section_id": 0, "tab_id": None}),
+    "get_console_logs": ("get_console_logs", {"tab_id": None}),
+    "expand": ("_expand", {"section_id": 0, "tab_id": None, "minimal": True}),
+    "collapse": ("_collapse", {"section_id": 0, "tab_id": None, "minimal": True}),
+    "clear_cookies": ("_clear_cookies", {}),
+}
+
+
 class SurfboardAPI:
     def __init__(self) -> None:
         self.fetcher = BrowserFetcher()
@@ -57,39 +92,7 @@ class SurfboardAPI:
             if alias_from in params and alias_to not in params:
                 params[alias_to] = params[alias_from]
 
-        # Inline dispatch — single source of truth
-        dispatch = {
-            "browse": ("_navigate", {"url": "", "tab_id": None, "push_history": True}),
-            "click": ("_click", {"target": "", "tab_id": None, "minimal": True}),
-            "search": ("_search", {"query": ""}),
-            "fill": ("_fill", {"element_id": 0, "text": "", "tab_id": None}),
-            "fill_and_submit": ("_fill_and_submit", {"element_id": 0, "text": "", "tab_id": None}),
-            "hover": ("_hover", {"element_id": 0, "tab_id": None}),
-            "scroll_to": ("_scroll_to", {"element_id": 0, "tab_id": None}),
-            "scroll_by": ("_scroll_by", {"x": 0, "y": 0, "tab_id": None}),
-            "wait_for_load": ("_wait_for_load", {"timeout_ms": 10000, "tab_id": None}),
-            "wait_for_element": ("_wait_for_element", {"selector": "", "timeout_ms": 10000, "tab_id": None}),
-            "back": ("_back", {}),
-            "forward": ("_forward", {}),
-            "tab_new": ("_tab_new", {}),
-            "tab_switch": ("_tab_switch", {"tab_id": 0}),
-            "tab_close": ("_tab_close", {"tab_id": None}),
-            "refresh": ("_refresh", {"tab_id": None}),
-            "get_page": ("_get_page", {"tab_id": None}),
-            "status": ("_status", {}),
-            "evaluate": ("_evaluate", {"js_code": "", "tab_id": None}),
-            "get_full_text": ("_get_full_text", {"tab_id": None}),
-            "screenshot": ("_screenshot", {"path": None, "tab_id": None}),
-            "press_key": ("_press_key", {"key": "", "tab_id": None}),
-            "clipboard_copy": ("_clipboard_copy", {"text": "", "tab_id": None}),
-            "clipboard_read": ("_clipboard_read", {"tab_id": None}),
-            "highlight": ("_highlight", {"eids": [], "tab_id": None}),
-            "get_section": ("_get_section", {"section_id": 0, "tab_id": None}),
-            "expand": ("_expand", {"section_id": 0, "tab_id": None, "minimal": True}),
-            "collapse": ("_collapse", {"section_id": 0, "tab_id": None, "minimal": True}),
-            "clear_cookies": ("_clear_cookies", {}),
-        }
-        entry = dispatch.get(cmd)
+        entry = COMMAND_DISPATCH.get(cmd)
         if entry is None:
             # Check for legacy aliases
             alias_map = {"navigate": "browse", "open": "browse", "page": "get_page"}
@@ -211,7 +214,10 @@ class SurfboardAPI:
             return f"{tag}[placeholder={_css_quote(el.placeholder)}]"
         if el.href and tag == "a":
             return f"a[href={_css_quote(el.href)}]"
-        return tag
+        # Use visible text as last-resort selector to avoid bare tag matches
+        if el.text:
+            return f"{tag}:has-text({_css_quote(el.text[:50])})"
+        return f"{tag}:nth-of-type(1)"
 
     def _build_fallback_selectors(self, el) -> list[str]:
         """Generate alternative selectors for hard-to-click elements."""
@@ -258,7 +264,7 @@ class SurfboardAPI:
 
         return fallbacks
 
-    def _click(self, target: str, tab_id: int | None = None, minimal: bool | None = None) -> dict[str, Any]:
+    def _click(self, target: str | int, tab_id: int | None = None, minimal: bool | None = None) -> dict[str, Any]:
         if minimal is None:
             minimal = True
         if tab_id is not None:
@@ -267,9 +273,9 @@ class SurfboardAPI:
         if not tab or not tab.page:
             return {"error": "No page loaded"}
 
-        target = target.replace("#", "")
-        if target.isdigit():
-            eid = int(target)
+        target_str = str(target).replace("#", "")
+        if target_str.isdigit():
+            eid = int(target_str)
             el = tab.page.element_by_id(eid)
             if not el:
                 return {"error": f"No element with ID {eid}"}
@@ -281,7 +287,10 @@ class SurfboardAPI:
             click_result = self.fetcher.click(selector, fallback_selectors=fallbacks)
             if "error" in click_result:
                 return {**click_result, "element_id": eid, "hint": "The page DOM may have changed. Use get_page() to refresh."}
-            self.fetcher.wait_for_load(timeout_ms=3000)
+            try:
+                self.fetcher.wait_for_load(timeout_ms=10000)
+            except Exception:
+                pass
             html = self.fetcher.content()
             url = self.fetcher.current_url() or tab.url
             if html and not minimal:
@@ -381,10 +390,10 @@ class SurfboardAPI:
             result["submit_error"] = submit_result["error"]
             result["element_id"] = element_id
         else:
-            self.fetcher.wait_for_load(timeout_ms=3000)
+            self.fetcher.wait_for_load(timeout_ms=10000)
             result["submitted"] = True
             result["strategy"] = submit_result.get("strategy")
-            url = self.fetcher.evaluate("window.location.href")
+            url = self.fetcher.evaluate("window.location.href", quiet=True)
             if not url.startswith("error"):
                 result["url_after"] = url
             # Update tab page if navigation happened
@@ -475,32 +484,41 @@ class SurfboardAPI:
         except Exception as e:
             return {"error": str(e)}
 
-    def _back(self) -> dict[str, Any]:
+    def _back(self, _depth: int = 0) -> dict[str, Any]:
+        if _depth > 10:
+            return {"back": False, "error": "too many error pages in history"}
         try:
             self.fetcher.go_back()
             self.fetcher.wait_for_load(timeout_ms=5000)
             html = self.fetcher.content()
             url = self.fetcher.current_url()
             tab = self.session.active_tab
-            if tab and html:
+            if tab and html and not url.startswith("chrome-error:"):
                 tab.url = url
                 tab.page = build_page(html, url, url)
-                tab.push_url(url)
+                return {"back": True, "url": url}
+            if url.startswith("chrome-error:") or url in ("about:blank", ""):
+                return self._back(_depth + 1)
             return {"back": True, "url": url}
         except Exception as e:
             return {"back": False, "error": str(e)}
 
-    def _forward(self) -> dict[str, Any]:
+    def _forward(self, _depth: int = 0) -> dict[str, Any]:
+        if _depth > 10:
+            return {"forward": False, "error": "too many error pages in history"}
         try:
             self.fetcher.go_forward()
             self.fetcher.wait_for_load(timeout_ms=5000)
             html = self.fetcher.content()
             url = self.fetcher.current_url()
             tab = self.session.active_tab
-            if tab and html:
+            if tab and html and not url.startswith("chrome-error:"):
                 tab.url = url
                 tab.page = build_page(html, url, url)
-                tab.push_url(url)
+                return {"forward": True, "url": url}
+            # Skip past error/blank pages
+            if url.startswith("chrome-error:") or url in ("about:blank", ""):
+                return self._forward(_depth + 1)
             return {"forward": True, "url": url}
         except Exception as e:
             return {"forward": False, "error": str(e)}

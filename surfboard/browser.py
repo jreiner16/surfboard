@@ -178,21 +178,23 @@ class BrowserFetcher:
                 error=str(e),
             )
 
-    def evaluate(self, js_code: str) -> str:
+    def evaluate(self, js_code: str, quiet: bool = False) -> str:
         if not self._page:
             return "error: no page loaded"
         try:
             result = self._page.evaluate(js_code)
-            logs = self.get_console_logs()
             output = str(result) if result is not None else "null"
-            if logs:
-                output += "\n[console]\n" + "\n".join(logs)
+            if not quiet:
+                logs = self.get_console_logs()
+                if logs:
+                    output += "\n[console]\n" + "\n".join(logs)
             return output
         except Exception as e:
-            logs = self.get_console_logs()
             msg = f"error: {e}"
-            if logs:
-                msg += "\n[console]\n" + "\n".join(logs)
+            if not quiet:
+                logs = self.get_console_logs()
+                if logs:
+                    msg += "\n[console]\n" + "\n".join(logs)
             return msg
 
     def get_full_text(self) -> str:
@@ -493,7 +495,10 @@ class BrowserFetcher:
         try:
             result = self._page.evaluate(f"""() => {{
                 const requested = {json.dumps(eids)};
-                const totalElements = document.querySelectorAll('a, button, input, textarea, select, [tabindex]').length;
+
+                // Use same selector order as cleaner.py _extract_elements() for consistent indexing
+                const SELECTOR = 'a[href], button, input:not([type=hidden]), textarea, select';
+                const totalElements = document.querySelectorAll(SELECTOR).length;
 
                 document.querySelectorAll('.surfboard-highlight').forEach(el => {{
                     el.style.outline = el.dataset.surfboardOrigOutline || '';
@@ -506,7 +511,7 @@ class BrowserFetcher:
                 const found = [];
                 const notFound = [];
                 let count = 0;
-                document.querySelectorAll('a, button, input, textarea, select, [tabindex]').forEach((el, idx) => {{
+                document.querySelectorAll(SELECTOR).forEach((el, idx) => {{
                     const eid = idx + 1;
                     if (requested.includes(eid)) {{
                         el.dataset.surfboardOrigOutline = el.style.outline;

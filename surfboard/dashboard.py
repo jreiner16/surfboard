@@ -14,12 +14,8 @@ from integrations import setup as wizard
 HISTORY_FILE = Path.home() / ".surfboard" / "history.jsonl"
 
 TOOLS = [
-    "Claude Desktop",
-    "Cursor",
-    "OpenCode",
-    "VS Code (GitHub Copilot)",
-    "Windsurf",
-    "Claude Code (CLI)",
+    "Claude Desktop", "Cursor", "OpenCode",
+    "VS Code (GitHub Copilot)", "Windsurf", "Claude Code (CLI)",
 ]
 
 

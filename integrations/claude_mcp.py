@@ -5,7 +5,7 @@ import json
 import sys
 from typing import Any, Optional
 
-from integrations.api import SurfboardAPI
+from integrations.api import COMMAND_DISPATCH, SurfboardAPI
 
 
 # ---------------------------------------------------------------------------
@@ -277,40 +277,8 @@ _TOOL_DEFS: list[dict[str, Any]] = [
     },
 ]
 
-# Tool name → API method mapping (for _call_tool dispatch)
-# NOTE: param spec keys MUST match the API method parameter names exactly.
-_TOOL_DISPATCH: dict[str, tuple[str, dict[str, Any]]] = {
-    "browse": ("_navigate", {"url": "", "tab_id": None, "push_history": True}),
-    "click": ("_click", {"target": "", "tab_id": None, "minimal": True}),
-    "fill": ("_fill", {"element_id": 0, "text": "", "tab_id": None}),
-    "fill_and_submit": ("_fill_and_submit", {"element_id": 0, "text": "", "tab_id": None}),
-    "search": ("_search", {"query": ""}),
-    "get_page": ("_get_page", {"tab_id": None}),
-    "get_full_text": ("_get_full_text", {"tab_id": None}),
-    "get_section": ("_get_section", {"section_id": 0, "tab_id": None}),
-    "get_console_logs": ("get_console_logs", {"tab_id": None}),
-    "expand": ("_expand", {"section_id": 0, "tab_id": None, "minimal": True}),
-    "collapse": ("_collapse", {"section_id": 0, "tab_id": None, "minimal": True}),
-    "back": ("_back", {}),
-    "forward": ("_forward", {}),
-    "tab_new": ("_tab_new", {}),
-    "tab_switch": ("_tab_switch", {"tab_id": 0}),
-    "tab_close": ("_tab_close", {"tab_id": None}),
-    "refresh": ("_refresh", {"tab_id": None}),
-    "status": ("_status", {}),
-    "evaluate": ("_evaluate", {"js_code": "", "tab_id": None}),
-    "screenshot": ("_screenshot", {"path": None, "tab_id": None}),
-    "wait_for_load": ("_wait_for_load", {"timeout_ms": 10000, "tab_id": None}),
-    "wait_for_element": ("_wait_for_element", {"selector": "", "timeout_ms": 10000, "tab_id": None}),
-    "scroll_to": ("_scroll_to", {"element_id": 0, "tab_id": None}),
-    "scroll_by": ("_scroll_by", {"x": 0, "y": 0, "tab_id": None}),
-    "hover": ("_hover", {"element_id": 0, "tab_id": None}),
-    "press_key": ("_press_key", {"key": "", "tab_id": None}),
-    "clipboard_copy": ("_clipboard_copy", {"text": "", "tab_id": None}),
-    "clipboard_read": ("_clipboard_read", {"tab_id": None}),
-    "highlight": ("_highlight", {"eids": [], "tab_id": None}),
-    "clear_cookies": ("_clear_cookies", {}),
-}
+# Dispatch table imported from api.py (single source of truth).
+# COMMAND_DISPATCH maps tool names → (API_method_name, default_params).
 
 class SurfboardMCPServer:
     def __init__(self) -> None:
@@ -363,7 +331,7 @@ class SurfboardMCPServer:
         args = params.get("arguments", {})
         req_id = request.get("id")
 
-        entry = _TOOL_DISPATCH.get(name)
+        entry = COMMAND_DISPATCH.get(name)
         if entry is None:
             return {
                 "jsonrpc": "2.0",
