@@ -11,9 +11,7 @@ PREVIEW_CHARS = 800
 
 
 def build_page(html: str, url: str, final_url: str) -> Page:
-    text, raw_elements = clean_html(html, url)
-
-    soup = BeautifulSoup(html, "lxml")
+    text, raw_elements, soup = clean_html(html, url)
 
     page = Page(url=final_url, title=_extract_title(soup))
 
@@ -54,6 +52,7 @@ def build_page(html: str, url: str, final_url: str) -> Page:
                 content=text,
                 full_content=text,
                 elements=page.elements,
+                section_id=1,
             )
         ]
 
@@ -136,16 +135,6 @@ def _assign_elements_to_sections(
     if not elements or not sections:
         return
 
-    section_by_title: dict[str, Section] = {}
-
-    def _walk(secs: list[Section]) -> None:
-        for s in secs:
-            if s.title:
-                section_by_title[s.title] = s
-            _walk(s.subsections)
-
-    _walk(sections)
-
     headings = [
         h for h in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"])
         if h.get_text(strip=True)
@@ -153,13 +142,28 @@ def _assign_elements_to_sections(
     if not headings:
         return
 
+    # Build flat section list in heading order (tree traversal) so elements
+    # are assigned by position, not by heading text (avoids duplicate-title bugs).
+    flat_sections: list[Section] = []
+    def _walk(secs: list[Section]) -> None:
+        for s in secs:
+            flat_sections.append(s)
+            _walk(s.subsections)
+    _walk(sections)
+
     el_tags: list[Tag] = []
     for selector in ("a[href]", "button", "input:not([type=hidden])", "textarea", "select"):
         el_tags.extend(soup.select(selector))
 
+    # Build O(1) lookup dict for elements
+    el_lookup: dict[tuple, list[Element]] = {}
+    for el in elements:
+        key = (el.tag, el.text, el.href or "", el.attributes.get("id", ""), el.name or "")
+        el_lookup.setdefault(key, []).append(el)
+
     heading_idx = 0
     for el_tag in el_tags:
-        if heading_idx >= len(headings):
+        if heading_idx >= len(headings) or heading_idx >= len(flat_sections):
             break
 
         while heading_idx + 1 < len(headings):
@@ -178,23 +182,16 @@ def _assign_elements_to_sections(
             else:
                 break
 
-        heading_text = headings[heading_idx].get_text(strip=True)
-        section = section_by_title.get(heading_text)
-        if section is None:
-            continue
+        section = flat_sections[heading_idx]
 
         tag_text = el_tag.get_text(strip=True)
         tag_href = el_tag.get("href", "") if el_tag.name == "a" else ""
         tag_id = str(el_tag.get("id", ""))
         tag_name = str(el_tag.get("name", ""))
 
-        for el in elements:
-            if (el.tag == el_tag.name
-                    and el.text == tag_text
-                    and (el.href or "") == tag_href
-                    and (el.attributes.get("id", "") == tag_id or not tag_id)
-                    and (el.name or "") == tag_name
-                    and el not in section.elements):
+        key = (el_tag.name, tag_text, tag_href, tag_id, tag_name)
+        for el in el_lookup.get(key, []):
+            if el not in section.elements:
                 section.elements.append(el)
                 break
 

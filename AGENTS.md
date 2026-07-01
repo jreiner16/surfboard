@@ -6,7 +6,7 @@ Surfboard uses **Playwright** (headless Chromium) for real JS rendering — no C
 
 When you need to browse the web, search, or fetch live content, use the `surfboard` MCP tools. Available tools:
 
-- `surfboard_search` — Search the web via Google. Pass `query` string.
+- `surfboard_search` — Search the web via Google. Pass `query` string. Opens a new tab by default; pass `tab_id` to reuse an existing tab.
 - `surfboard_browse` — Navigate to a URL. Pass `url` string.
 - `surfboard_click` — Click an element by its ID number. Pass `target` integer. Navigates on links, triggers actions on buttons. Default `minimal=true` (omit page structure from response).
 - `surfboard_get_page` — Get the current page content (sections, elements, links).
@@ -17,10 +17,13 @@ When you need to browse the web, search, or fetch live content, use the `surfboa
 - `surfboard_evaluate` — Execute JavaScript on the page. Pass `js_code` string.
 - `surfboard_get_full_text` — Extract the full rendered text (document.body.innerText).
 - `surfboard_screenshot` — Take a full-page PNG screenshot (base64).
+- `surfboard_fill` — Type text into an input field. Pass `element_id`, `text`.
 - `surfboard_fill_and_submit` — Type text into an input and press Enter. Pass `element_id`, `text`.
 - `surfboard_press_key` — Press a keyboard key (e.g., 'Enter', 'Escape').
 - `surfboard_clipboard_copy` / `surfboard_clipboard_read` — Browser clipboard access.
 - `surfboard_highlight` — Highlight elements by their IDs (yellow outline). Pass `eids` array.
+- `surfboard_scroll_by` / `surfboard_scroll_to` — Scroll the viewport or an element into view.
+- `surfboard_hover` — Hover over an element by its ID.
 
 ### Workflow
 1. `surfboard_search` to find something

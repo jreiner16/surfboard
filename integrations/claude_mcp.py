@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import inspect
 import json
+import os
 import sys
 from typing import Any, Optional
 
-from integrations.api import COMMAND_DISPATCH, SurfboardAPI
+from integrations.api import SurfboardAPI
 
 
 # ---------------------------------------------------------------------------
@@ -66,8 +66,15 @@ _TOOL_DEFS: list[dict[str, Any]] = [
     },
     {
         "name": "search",
-        "description": "Search the web for a query",
-        "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+        "description": "Search the web for a query (opens a new tab by default)",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query"},
+                "tab_id": {"type": "integer", "description": "Tab to reuse (omit to open a new tab)"},
+            },
+            "required": ["query"],
+        },
     },
     {
         "name": "get_page",
@@ -281,8 +288,14 @@ _TOOL_DEFS: list[dict[str, Any]] = [
 # COMMAND_DISPATCH maps tool names → (API_method_name, default_params).
 
 class SurfboardMCPServer:
-    def __init__(self) -> None:
-        self.api = SurfboardAPI()
+    def __init__(self, block_resources: bool = False, proxy: str | None = None,
+                 calls_per_sec: float = 10.0, cache_ttl: float = 300.0) -> None:
+        self.api = SurfboardAPI(
+            block_resources=block_resources,
+            proxy=proxy,
+            calls_per_sec=calls_per_sec,
+            cache_ttl=cache_ttl,
+        )
 
     def handle_request(self, request: dict[str, Any]) -> Optional[dict[str, Any]]:
         method = request.get("method", "")
@@ -314,7 +327,7 @@ class SurfboardMCPServer:
             "result": {
                 "protocolVersion": client_version,
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "surfboard", "version": "0.1.0"},
+                "serverInfo": {"name": "surfboard", "version": "0.1.0", "options": {"block_resources": self.api.fetcher.block_resources, "proxy": self.api.fetcher.proxy, "calls_per_sec": self.api.fetcher.rate_limiter._min_interval, "cache_ttl": self.api._page_cache._default_ttl}},
             },
         }
 
@@ -331,24 +344,7 @@ class SurfboardMCPServer:
         args = params.get("arguments", {})
         req_id = request.get("id")
 
-        entry = COMMAND_DISPATCH.get(name)
-        if entry is None:
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "error": {"code": -32602, "message": f"Unknown tool: {name}"},
-            }
-
-        method_name, param_spec = entry
-        kwargs = {}
-        for key, default in param_spec.items():
-            raw = args.get(key)
-            kwargs[key] = raw if raw is not None else default
-
-        method = getattr(self.api, method_name)
-        sig = inspect.signature(method)
-        filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
-        result = method(**filtered)
+        result = self.api.call_tool(name, args)
 
         if "error" in result:
             return {
@@ -388,7 +384,12 @@ class SurfboardMCPServer:
 
 
 def main() -> None:
-    server = SurfboardMCPServer()
+    server = SurfboardMCPServer(
+        block_resources=os.environ.get("SURFBOARD_BLOCK_RESOURCES", "").lower() in ("1", "true", "yes"),
+        proxy=os.environ.get("SURFBOARD_PROXY") or None,
+        calls_per_sec=float(os.environ.get("SURFBOARD_CALLS_PER_SEC", "10.0")),
+        cache_ttl=float(os.environ.get("SURFBOARD_CACHE_TTL", "300.0")),
+    )
     server.run()
 
 

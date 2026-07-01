@@ -8,9 +8,9 @@ from bs4 import BeautifulSoup, Tag
 from readability import Document
 
 
-def clean_html(html: str, source_url: str) -> tuple[str, list[dict]]:
+def clean_html(html: str, source_url: str) -> tuple[str, list[dict], BeautifulSoup]:
     if not html.strip():
-        return "", []
+        return "", [], BeautifulSoup("", "lxml")
 
     full_soup = BeautifulSoup(html, "lxml")
 
@@ -36,7 +36,7 @@ def clean_html(html: str, source_url: str) -> tuple[str, list[dict]]:
 
     elements = _extract_elements(full_soup, source_url)
 
-    return text, elements
+    return text, elements, full_soup
 
 
 SKIP_EXTENSIONS = {".css", ".js", ".ico", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".woff", ".woff2", ".ttf"}
@@ -89,73 +89,83 @@ def _extract_elements(soup: BeautifulSoup, base_url: str) -> list[dict]:
     seen = set()
     eid = 1
 
-    for selector, etype in [
-        ("a[href]", "link"),
-        ("button", "button"),
-        ("input:not([type=hidden])", "text_input"),
-        ("textarea", "textarea"),
-        ("select", "select"),
-    ]:
-        for tag in soup.select(selector):
-            text = tag.get_text(strip=True)
-            href = tag.get("href", "") if tag.name == "a" else ""
+    combined_selector = "a[href], button, input:not([type=hidden]), textarea, select"
+    for tag in soup.select(combined_selector):
+        text = tag.get_text(strip=True)
+        href = tag.get("href", "") if tag.name == "a" else ""
 
-            if tag.name == "a" and not text and not tag.get("aria-label"):
+        if tag.name == "input":
+            input_type = tag.get("type", "text")
+            if input_type in ("checkbox", "radio"):
+                etype = input_type
+            elif input_type in ("submit", "reset", "button"):
+                etype = "button"
+            else:
+                etype = "text_input"
+        elif tag.name == "a":
+            etype = "link"
+        elif tag.name == "button":
+            etype = "button"
+        elif tag.name == "textarea":
+            etype = "textarea"
+        elif tag.name == "select":
+            etype = "select"
+        else:
+            continue
+
+        if tag.name == "a" and not text and not tag.get("aria-label"):
+            continue
+        if tag.name == "a" and href:
+            ext = href.rsplit(".", 1)[-1].lower() if "." in href else ""
+            if ext in SKIP_EXTENSIONS:
                 continue
-            if tag.name == "a" and href:
-                ext = href.rsplit(".", 1)[-1].lower() if "." in href else ""
-                if ext in SKIP_EXTENSIONS:
-                    continue
-                if _is_tracking(href):
-                    continue
-                if _parent_has_ad_class(tag):
-                    continue
-                if len(href) > 300:
-                    continue
-
-            key = (str(tag.name), href, str(tag.get("id", "")), str(tag.get("name", "")), text)
-            if key in seen:
+            if _is_tracking(href):
                 continue
-            seen.add(key)
+            if _parent_has_ad_class(tag):
+                continue
+            if len(href) > 300:
+                continue
 
-            el = {"id": eid, "type": etype, "tag": tag.name}
-            el["text"] = text
+        key = (str(tag.name), href, str(tag.get("id", "")), str(tag.get("name", "")), text)
+        if key in seen:
+            continue
+        seen.add(key)
 
-            if isinstance(tag, Tag):
-                el["attributes"] = {k: v for k, v in tag.attrs.items() if isinstance(v, str)}
+        el = {"id": eid, "type": etype, "tag": tag.name}
+        el["text"] = text
 
-            if tag.name == "a":
-                resolved = urljoin(base_url, href) if href else None
-                if resolved:
-                    resolved = _unwrap_redirect(resolved)
-                el["href"] = resolved
+        if isinstance(tag, Tag):
+            el["attributes"] = {k: v for k, v in tag.attrs.items() if isinstance(v, str)}
 
-            if tag.name == "input":
-                el["name"] = tag.get("name")
-                el["placeholder"] = tag.get("placeholder")
-                el["value"] = tag.get("value")
-                input_type = tag.get("type", "text")
-                if input_type in ("checkbox", "radio"):
-                    el["type"] = input_type
+        if tag.name == "a":
+            resolved = urljoin(base_url, href) if href else None
+            if resolved:
+                resolved = _unwrap_redirect(resolved)
+            el["href"] = resolved
 
-            if tag.name == "textarea":
-                el["name"] = tag.get("name")
-                el["placeholder"] = tag.get("placeholder")
+        if tag.name == "input":
+            el["name"] = tag.get("name")
+            el["placeholder"] = tag.get("placeholder")
+            el["value"] = tag.get("value")
 
-            if tag.name == "select":
-                el["name"] = tag.get("name")
-                options = tag.find_all("option")
-                el["options"] = [
-                    {"value": o.get("value", ""), "text": o.get_text(strip=True)}
-                    for o in options
-                ]
+        if tag.name == "textarea":
+            el["name"] = tag.get("name")
+            el["placeholder"] = tag.get("placeholder")
 
-            if tag.name == "button":
-                el["name"] = tag.get("name")
-                el["value"] = tag.get("value")
+        if tag.name == "select":
+            el["name"] = tag.get("name")
+            options = tag.find_all("option")
+            el["options"] = [
+                {"value": o.get("value", ""), "text": o.get_text(strip=True)}
+                for o in options
+            ]
 
-            elements.append(el)
-            eid += 1
+        if tag.name == "button":
+            el["name"] = tag.get("name")
+            el["value"] = tag.get("value")
+
+        elements.append(el)
+        eid += 1
 
     return elements
 

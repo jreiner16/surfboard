@@ -1,13 +1,20 @@
+"""Playwright-based headless browser with stealth, caching, and interception."""
+
 from __future__ import annotations
 
+import base64
+import hashlib
 import io
 import json
-import os
+import time
 from pathlib import Path
-import re
 import urllib.request
 
 from surfboard.fetcher import FetchResult, _is_bot_block
+from surfboard.log import get_logger
+from surfboard.stealth import STEALTH_INIT_SCRIPT
+
+_logger = get_logger()
 
 PLAYWRIGHT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -15,91 +22,100 @@ PLAYWRIGHT_UA = (
     "Chrome/128.0.0.0 Safari/537.36"
 )
 
-_STEALTH_INIT_SCRIPT = """
-// Remove webdriver property
-Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+RESOURCE_BLOCK_PATTERNS = [
+    "**/*.png", "**/*.jpg", "**/*.jpeg", "**/*.gif",
+    "**/*.svg", "**/*.webp", "**/*.ico",
+    "**/*.woff", "**/*.woff2", "**/*.ttf", "**/*.eot",
+    "**/*.mp4", "**/*.webm", "**/*.ogg",
+]
 
-// Chrome plugins
-Object.defineProperty(navigator, 'plugins', {
-    get: () => [1, 2, 3, 4, 5],
-});
+KNOWN_MODIFIERS = {"ctrl", "shift", "alt", "meta", "control", "command", "option"}
 
-// Languages
-Object.defineProperty(navigator, 'languages', {
-    get: () => ['en-US', 'en'],
-});
+# ---------------------------------------------------------------------------
+# Rate limiter
+# ---------------------------------------------------------------------------
 
-// Chrome runtime
-window.chrome = {
-    runtime: {},
-    loadTimes: function() {},
-    csi: function() {},
-    app: {},
-};
+class RateLimiter:
+    """Simple token-bucket rate limiter."""
 
-// Permissions
-navigator.permissions.query = (() => {
-    const original = navigator.permissions.query.bind(navigator.permissions);
-    return (params) => {
-        if (params.name === 'notifications') {
-            return Promise.resolve({ state: 'denied', onchange: null });
-        }
-        return original(params);
-    };
-})();
+    def __init__(self, calls_per_sec: float = 10.0):
+        self._min_interval = 1.0 / max(calls_per_sec, 0.1)
+        self._last_call = 0.0
 
-// WebGL vendor
-const getExt = HTMLCanvasElement.prototype.getContext;
-HTMLCanvasElement.prototype.getContext = function(type, ...args) {
-    const ctx = getExt.call(this, type, ...args);
-    if (ctx && type === 'webgl') {
-        const getParam = ctx.getParameter;
-        ctx.getParameter = function(param) {
-            if (param === 37445) return 'Intel Inc.';
-            if (param === 37446) return 'Intel Iris OpenGL Engine';
-            return getParam.call(this, param);
-        };
-    }
-    return ctx;
-};
+    def acquire(self) -> float:
+        now = time.time()
+        wait = self._min_interval - (now - self._last_call)
+        if wait > 0:
+            time.sleep(wait)
+            now = time.time()
+        self._last_call = now
+        return wait if wait > 0 else 0.0
 
-// Remove headless chrome detection
-Object.defineProperty(navigator, 'connection', {
-    get: () => ({ rtt: 100, effectiveType: '4g' }),
-});
+# ---------------------------------------------------------------------------
+# Cookie storage (base64-obfuscated)
+# ---------------------------------------------------------------------------
 
-// Fake device memory
-Object.defineProperty(navigator, 'deviceMemory', {
-    get: () => 8,
-});
+def _encode_cookies(cookies: list[dict]) -> str:
+    raw = json.dumps(cookies)
+    return base64.b64encode(raw.encode()).decode()
 
-// Fake hardware concurrency
-Object.defineProperty(navigator, 'hardwareConcurrency', {
-    get: () => 8,
-});
-"""
+def _decode_cookies(data: str) -> list[dict]:
+    try:
+        raw = base64.b64decode(data.encode()).decode()
+        return json.loads(raw)
+    except Exception:
+        return []
 
+# ---------------------------------------------------------------------------
+# Main browser class
+# ---------------------------------------------------------------------------
 
 class BrowserFetcher:
-    def __init__(self, timeout: float = 30.0):
+    def __init__(self, timeout: float = 30.0, block_resources: bool = False,
+                 proxy: str | None = None, calls_per_sec: float = 10.0):
         self.timeout = timeout
+        self.block_resources = block_resources
+        self.proxy = proxy
+        self.rate_limiter = RateLimiter(calls_per_sec)
         self._playwright = None
         self._browser = None
         self._context = None
-        self._page = None
+        self._pages: dict[int, object] = {}       # tab_id → Playwright Page
+        self._active_tab_id: int | None = None
+        self._page: object | None = None           # cached ref to active page
         self._console_logs: list[str] = []
+        self._last_cookie_hash: str | None = None
+        self._resource_block_enabled = block_resources
+        self._request_interceptors: list[callable] = []
+
+    # -- Lifecycle ----------------------------------------------------------
+
+    def _ensure_page(self) -> bool:
+        """Ensure browser + context are running (pages are created per-tab)."""
+        if self._context:
+            return True
+        try:
+            self._start()
+            return True
+        except ImportError:
+            return False
+        except Exception:
+            return False
 
     def _start(self):
         from playwright.sync_api import sync_playwright
         self._playwright = sync_playwright().start()
+        launch_args = [
+            "--no-sandbox",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=IsolateOrigins,site-per-process",
+            "--disable-component-update",
+        ]
+        if self.proxy:
+            launch_args.append(f"--proxy-server={self.proxy}")
         self._browser = self._playwright.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-features=IsolateOrigins,site-per-process",
-                "--disable-component-update",
-            ],
+            args=launch_args,
         )
         self._context = self._browser.new_context(
             user_agent=PLAYWRIGHT_UA,
@@ -108,79 +124,309 @@ class BrowserFetcher:
             locale="en-US",
             timezone_id="America/New_York",
         )
-        self._page = self._context.new_page()
-        self._page.add_init_script(_STEALTH_INIT_SCRIPT)
-        self._page.set_default_timeout(10000)
 
-        # Capture console logs
-        self._console_logs = []
-        self._page.on("console", lambda msg: self._console_logs.append(f"[{msg.type}] {msg.text}"))
+    def _setup_page(self, page) -> None:
+        """Configure a newly-created page (stealth, routes, listeners)."""
+        page.add_init_script(STEALTH_INIT_SCRIPT)
+        page.set_default_timeout(10000)
+        if self._resource_block_enabled:
+            page.route(
+                RESOURCE_BLOCK_PATTERNS,
+                lambda route: route.abort(),
+            )
+        page.on("console", lambda msg: self._console_logs.append(f"[{msg.type}] {msg.text}"))
+        page.on("request", lambda req: self._on_request(req))
 
-        self._ensure_clipboard_permissions()
-        self._restore_cookies()
+    def create_page(self, tab_id: int) -> bool:
+        """Create a Playwright page for *tab_id* and set it as active."""
+        if not self._ensure_page():
+            return False
+        try:
+            page = self._context.new_page()
+            self._setup_page(page)
+            self._pages[tab_id] = page
+            self._active_tab_id = tab_id
+            self._page = page
+            self._ensure_clipboard_permissions()
+            self._restore_cookies()
+            return True
+        except Exception:
+            return False
 
-    def get_console_logs(self) -> list[str]:
-        logs = list(self._console_logs)
-        self._console_logs = []
-        return logs
+    def set_active_tab(self, tab_id: int) -> bool:
+        """Switch the active Playwright page to *tab_id*'s page."""
+        page = self._pages.get(tab_id)
+        if page is None:
+            return False
+        self._active_tab_id = tab_id
+        self._page = page
+        return True
 
-    def peek_console_logs(self) -> list[str]:
-        return list(self._console_logs)
+    def close_page(self, tab_id: int) -> None:
+        """Close the Playwright page for *tab_id* and update active page."""
+        page = self._pages.pop(tab_id, None)
+        if page:
+            try:
+                page.close()
+            except Exception:
+                pass
+        if self._active_tab_id == tab_id:
+            if self._pages:
+                nid = next(iter(self._pages))
+                self._active_tab_id = nid
+                self._page = self._pages[nid]
+            else:
+                self._active_tab_id = None
+                self._page = None
+
+    def _on_request(self, request) -> None:
+        for fn in self._request_interceptors:
+            try:
+                fn(request)
+            except Exception:
+                _logger.warn("interceptor", "request interceptor failed", "error")
+
+    def add_request_interceptor(self, fn: callable) -> None:
+        """Register a callback receiving Playwright Request objects."""
+        self._request_interceptors.append(fn)
+
+    def _try_restart(self) -> bool:
+        """Attempt to restart the browser and recreate all pages (crash recovery)."""
+        tab_ids = list(self._pages.keys())
+        active_id = self._active_tab_id
+        self._pages.clear()
+        self._active_tab_id = None
+        self._page = None
+        try:
+            if self._context:
+                self._context.close()
+            if self._browser:
+                self._browser.close()
+            if self._playwright:
+                self._playwright.stop()
+        except Exception:
+            pass
+        self._playwright = None
+        self._browser = None
+        self._context = None
+        try:
+            self._start()
+            for tid in tab_ids:
+                page = self._context.new_page()
+                self._setup_page(page)
+                self._pages[tid] = page
+            if active_id in self._pages:
+                self._active_tab_id = active_id
+                self._page = self._pages[active_id]
+            self._ensure_clipboard_permissions()
+            self._restore_cookies()
+            return True
+        except Exception:
+            return False
+
+    def close(self):
+        exceptions = []
+        for tid in list(self._pages.keys()):
+            page = self._pages.pop(tid, None)
+            if page:
+                try:
+                    page.close()
+                except Exception as e:
+                    exceptions.append(e)
+        self._active_tab_id = None
+        self._page = None
+        if self._context:
+            try:
+                self._context.close()
+            except Exception as e:
+                exceptions.append(e)
+            self._context = None
+        if self._browser:
+            try:
+                self._browser.close()
+            except Exception as e:
+                exceptions.append(e)
+            self._browser = None
+        if self._playwright:
+            try:
+                self._playwright.stop()
+            except Exception as e:
+                exceptions.append(e)
+            self._playwright = None
+        if exceptions:
+            raise Exception(
+                f"Multiple errors during browser close: {'; '.join(str(e) for e in exceptions)}"
+            )
+
+    def __enter__(self) -> BrowserFetcher:
+        return self
+
+    def __exit__(self, *args) -> None:
+        self.close()
+
+    # -- Cookie management --------------------------------------------------
 
     def _cookie_path(self) -> Path:
-        return Path.home() / ".surfboard" / "cookies.json"
+        return Path.home() / ".surfboard" / "cookies.dat"
 
     def _save_cookies(self):
+        if not self._context:
+            return
         cookies = self._context.cookies()
+        cookie_hash = hashlib.sha256(json.dumps(cookies, sort_keys=True).encode()).hexdigest()
+        if cookie_hash == self._last_cookie_hash:
+            return
         path = self._cookie_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(cookies, indent=2))
+        path.write_text(_encode_cookies(cookies))
+        self._last_cookie_hash = cookie_hash
 
     def _restore_cookies(self):
         path = self._cookie_path()
         if path.exists():
-            cookies = json.loads(path.read_text())
+            cookies = _decode_cookies(path.read_text())
             if cookies:
                 self._context.add_cookies(cookies)
+                self._last_cookie_hash = hashlib.sha256(
+                    json.dumps(cookies, sort_keys=True).encode()
+                ).hexdigest()
+
+    def clear_cookies(self):
+        if self._context:
+            self._context.clear_cookies()
+        path = self._cookie_path()
+        if path.exists():
+            path.unlink()
+        self._last_cookie_hash = None
+
+    # -- Navigation ---------------------------------------------------------
 
     def fetch(self, url: str) -> FetchResult:
-        if not self._page:
-            try:
-                self._start()
-            except ImportError:
-                return FetchResult(
-                    url=url, html="", status_code=0, headers={}, final_url=url,
-                    error="playwright not installed. Run: pip install playwright && playwright install chromium",
-                )
-            except Exception as e:
-                return FetchResult(
-                    url=url, html="", status_code=0, headers={}, final_url=url,
-                    error=f"Playwright init failed: {e}",
-                )
-
-        try:
-            self._page.goto(url, wait_until="domcontentloaded", timeout=int(self.timeout * 1000))
-
-            if _is_bot_block(self._page.content(), 200):
-                return FetchResult(
-                    url=url, html="", status_code=200, headers={}, final_url=self._page.url,
-                    error=f"Bot/CAPTCHA wall detected at {self._page.url}",
-                )
-
-            html = self._page.content()
-            self._save_cookies()
-            return FetchResult(
-                url=url, html=html, status_code=200, headers={}, final_url=self._page.url,
-            )
-        except Exception as e:
+        if not self._ensure_page():
             return FetchResult(
                 url=url, html="", status_code=0, headers={}, final_url=url,
-                error=str(e),
+                error="playwright not installed. Run: pip install playwright && playwright install chromium",
             )
+        if not self._page:
+            return FetchResult(
+                url=url, html="", status_code=0, headers={}, final_url=url,
+                error="no page loaded",
+            )
+        for attempt in range(2):
+            self.rate_limiter.acquire()
+            try:
+                self._page.goto(url, wait_until="domcontentloaded", timeout=int(self.timeout * 1000))
+
+                if _is_bot_block(self._page.content(), 200):
+                    return FetchResult(
+                        url=url, html="", status_code=200, headers={}, final_url=self._page.url,
+                        error=f"Bot/CAPTCHA wall detected at {self._page.url}",
+                    )
+
+                html = self._page.content()
+                self._save_cookies()
+                return FetchResult(
+                    url=url, html=html, status_code=200, headers={}, final_url=self._page.url,
+                )
+            except Exception as e:
+                if attempt == 0 and self._try_restart():
+                    _logger.warn("browse", f"Navigation failed, recovered via restart: {e}", "warn")
+                    continue
+                return FetchResult(
+                    url=url, html="", status_code=0, headers={}, final_url=url,
+                    error=str(e),
+                )
+        # unreachable
+        return FetchResult(
+            url=url, html="", status_code=0, headers={}, final_url=url,
+            error="unknown fetch error",
+        )
+
+    def go_back(self) -> dict:
+        if not self._page:
+            return {"error": "no page loaded"}
+        try:
+            self._page.go_back()
+            return {"navigated": True}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def go_forward(self) -> dict:
+        if not self._page:
+            return {"error": "no page loaded"}
+        try:
+            self._page.go_forward()
+            return {"navigated": True}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def can_go_back(self) -> bool:
+        page = self._page
+        if not page:
+            return False
+        try:
+            return bool(page.evaluate("window.navigation?.canGoBack ?? window.history.length > 1"))
+        except Exception:
+            return False
+
+    def can_go_forward(self) -> bool:
+        page = self._page
+        if not page:
+            return False
+        try:
+            return bool(page.evaluate("window.navigation?.canGoForward ?? false"))
+        except Exception:
+            return False
+
+    def wait_for_load(self, timeout_ms: int = 10000) -> dict:
+        if not self._page:
+            return {"error": "no page loaded"}
+        try:
+            self._page.wait_for_load_state("load", timeout=timeout_ms)
+            return {"loaded": True, "timeout_ms": timeout_ms}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def wait_for_element(self, selector: str, timeout_ms: int = 10000) -> dict:
+        if not self._page:
+            return {"error": "no page loaded"}
+        try:
+            self._page.wait_for_selector(selector, timeout=timeout_ms)
+            return {"found": True, "selector": selector, "timeout_ms": timeout_ms}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def content(self) -> str:
+        if not self._page:
+            return ""
+        try:
+            return self._page.content()
+        except Exception:
+            return ""
+
+    def current_url(self) -> str:
+        if not self._page:
+            return ""
+        try:
+            return self._page.url
+        except Exception:
+            return ""
+
+    def is_pdf(self) -> bool:
+        if not self._page:
+            return False
+        try:
+            ct = self._page.evaluate("document.contentType || ''")
+            return "pdf" in ct.lower()
+        except Exception:
+            return False
+
+    # -- JS evaluation & extraction -----------------------------------------
 
     def evaluate(self, js_code: str, quiet: bool = False) -> str:
         if not self._page:
             return "error: no page loaded"
+        self.rate_limiter.acquire()
         try:
             result = self._page.evaluate(js_code)
             output = str(result) if result is not None else "null"
@@ -216,20 +462,10 @@ class BrowserFetcher:
         except Exception:
             return None
 
-    def is_pdf(self) -> bool:
-        if not self._page:
-            return False
-        try:
-            ct = self._page.evaluate("document.contentType || ''")
-            return "pdf" in ct.lower()
-        except Exception:
-            return False
-
     def fetch_pdf_text(self) -> str | None:
         """Extract text from a PDF loaded in the browser. Falls back to pypdf2."""
         if not self._page:
             return None
-        # Try browser's built-in PDF viewer text layer first
         try:
             text = self._page.evaluate("""() => {
                 const el = document.querySelector('embed[type="application/pdf"], iframe[src*=".pdf"]');
@@ -241,7 +477,6 @@ class BrowserFetcher:
         except Exception:
             pass
 
-        # Fallback: download PDF bytes and extract with pypdf2
         try:
             pdf_url = self._page.url
             from PyPDF2 import PdfReader
@@ -266,48 +501,17 @@ class BrowserFetcher:
 
         return None
 
-    def content(self) -> str:
-        if not self._page:
-            return ""
-        try:
-            return self._page.content()
-        except Exception:
-            return ""
+    # -- Console logs -------------------------------------------------------
 
-    def current_url(self) -> str:
-        if not self._page:
-            return ""
-        try:
-            return self._page.url
-        except Exception:
-            return ""
+    def get_console_logs(self) -> list[str]:
+        logs = list(self._console_logs)
+        self._console_logs = []
+        return logs
 
-    def go_back(self) -> dict:
-        if not self._page:
-            return {"error": "no page loaded"}
-        try:
-            self._page.go_back()
-            return {"navigated": True}
-        except Exception as e:
-            return {"error": str(e)}
+    def peek_console_logs(self) -> list[str]:
+        return list(self._console_logs)
 
-    def go_forward(self) -> dict:
-        if not self._page:
-            return {"error": "no page loaded"}
-        try:
-            self._page.go_forward()
-            return {"navigated": True}
-        except Exception as e:
-            return {"error": str(e)}
-
-    def wait_for_load(self, timeout_ms: int = 10000) -> dict:
-        if not self._page:
-            return {"error": "no page loaded"}
-        try:
-            self._page.wait_for_load_state("load", timeout=timeout_ms)
-            return {"loaded": True, "timeout_ms": timeout_ms}
-        except Exception as e:
-            return {"error": str(e)}
+    # -- Element interaction ------------------------------------------------
 
     def _scroll_into_view(self, selector: str) -> None:
         try:
@@ -317,11 +521,12 @@ class BrowserFetcher:
             }}""")
             self._page.wait_for_timeout(200)
         except Exception:
-            pass
+            _logger.warn("scroll", f"scrollIntoView failed for {selector}", "warn")
 
     def click(self, selector: str, fallback_selectors: list[str] | None = None) -> dict:
         if not self._page:
             return {"error": "no page loaded"}
+        self.rate_limiter.acquire()
         selectors_to_try = [selector]
         if fallback_selectors:
             selectors_to_try.extend(fallback_selectors)
@@ -402,9 +607,7 @@ class BrowserFetcher:
             return {"error": "no page loaded"}
         try:
             self._scroll_into_view(selector)
-            # Playwright fill() triggers real input events (works for most frameworks)
             self._page.fill(selector, text)
-            # Additionally fire synthetic input+change for frameworks that use addEventListener
             self._page.evaluate(f"""() => {{
                 const el = document.querySelector({json.dumps(selector)});
                 if (!el) return;
@@ -420,33 +623,103 @@ class BrowserFetcher:
         if not self._page:
             return {"error": "no page loaded"}
         try:
-            # Support key combos: "Ctrl+C", "Shift+Enter", "Ctrl+Shift+F", etc.
             if "+" in key:
                 parts = key.split("+")
-                modifiers = parts[:-1]
-                actual_key = parts[-1]
-                mod_map = {"ctrl": "Control", "shift": "Shift", "alt": "Alt", "meta": "Meta"}
+                modifiers = []
+                actual_key = key
+                for i, part in enumerate(parts):
+                    if part.lower() in KNOWN_MODIFIERS:
+                        modifiers.append(part)
+                    else:
+                        actual_key = part
+                        remaining = parts[i + 1:]
+                        if remaining:
+                            actual_key = "+".join([part] + remaining)
+                        break
+                mod_map = {"ctrl": "Control", "shift": "Shift", "alt": "Alt", "meta": "Meta",
+                           "control": "Control", "command": "Meta", "option": "Alt"}
                 for mod in modifiers:
                     mapped = mod_map.get(mod.lower(), mod)
                     self._page.keyboard.down(mapped)
                 self._page.keyboard.press(actual_key)
-                for mod in modifiers:
+                for mod in reversed(modifiers):
                     mapped = mod_map.get(mod.lower(), mod)
                     self._page.keyboard.up(mapped)
             else:
                 self._page.keyboard.press(key)
 
-            # If pressing Enter, wait briefly for potential navigation
             normalized = key.lower().split("+")[-1]
             if normalized in ("enter", "return"):
                 try:
                     self._page.wait_for_load_state("load", timeout=5000)
                 except Exception:
-                    pass  # No navigation happened — that's fine
+                    pass
 
             return {"pressed": key}
         except Exception as e:
             return {"error": str(e)}
+
+    def submit_form(self, selector: str) -> dict:
+        """Smart form submission with multiple fallback strategies."""
+        if not self._page:
+            return {"error": "no page loaded"}
+        strategies = []
+
+        strategies.append(("Enter key", lambda: self._page.keyboard.press("Enter")))
+
+        strategies.append(("submit button", lambda: self._page.evaluate(f"""() => {{
+            const el = document.querySelector({json.dumps(selector)});
+            if (!el) return false;
+            const form = el.closest('form');
+            if (!form) return false;
+            const btn = form.querySelector('button[type=submit], input[type=submit], button:has(svg), button[aria-label*=search i], button:last-of-type');
+            if (btn) {{ btn.click(); return true; }}
+            return false;
+        }}""")))
+        strategies.append(("form.submit()", lambda: self._page.evaluate(f"""() => {{
+            const el = document.querySelector({json.dumps(selector)});
+            if (!el) return false;
+            const form = el.closest('form');
+            if (form) {{ form.submit(); return true; }}
+            return false;
+        }}""")))
+        strategies.append(("submit event", lambda: self._page.evaluate(f"""() => {{
+            const el = document.querySelector({json.dumps(selector)});
+            if (!el) return false;
+            const form = el.closest('form');
+            if (form) {{
+                form.dispatchEvent(new Event('submit', {{ bubbles: true, cancelable: true }}));
+                return true;
+            }}
+            return false;
+        }}""")))
+        strategies.append(("nearby button", lambda: self._page.evaluate(f"""() => {{
+            const el = document.querySelector({json.dumps(selector)});
+            if (!el) return false;
+            const form = el.closest('form');
+            if (form) {{
+                const btns = form.querySelectorAll('button');
+                if (btns.length > 0) {{ btns[0].click(); return true; }}
+            }}
+            const parent = el.parentElement;
+            if (parent) {{
+                const btn = parent.querySelector('button, input[type=submit]');
+                if (btn) {{ btn.click(); return true; }}
+            }}
+            return false;
+        }}""")))
+
+        for name, strategy in strategies:
+            try:
+                result = strategy()
+                if result is not False and result is not None:
+                    return {"submitted": True, "strategy": name}
+            except Exception:
+                continue
+
+        return {"error": "all form submission strategies failed"}
+
+    # -- Clipboard ----------------------------------------------------------
 
     def clipboard_copy(self, text: str) -> dict:
         if not self._page:
@@ -489,14 +762,14 @@ class BrowserFetcher:
             except Exception:
                 pass
 
+    # -- Highlighting -------------------------------------------------------
+
     def highlight_elements(self, eids: list[int]) -> dict:
         if not self._page:
             return {"error": "no page loaded"}
         try:
             result = self._page.evaluate(f"""() => {{
                 const requested = {json.dumps(eids)};
-
-                // Use same selector order as cleaner.py _extract_elements() for consistent indexing
                 const SELECTOR = 'a[href], button, input:not([type=hidden]), textarea, select';
                 const totalElements = document.querySelectorAll(SELECTOR).length;
 
@@ -538,111 +811,3 @@ class BrowserFetcher:
             return {"result": result}
         except Exception as e:
             return {"error": str(e)}
-
-    def wait_for_element(self, selector: str, timeout_ms: int = 10000) -> dict:
-        if not self._page:
-            return {"error": "no page loaded"}
-        try:
-            self._page.wait_for_selector(selector, timeout=timeout_ms)
-            return {"found": True, "selector": selector, "timeout_ms": timeout_ms}
-        except Exception as e:
-            return {"error": str(e)}
-
-    def submit_form(self, selector: str) -> dict:
-        """Smart form submission with multiple fallback strategies."""
-        if not self._page:
-            return {"error": "no page loaded"}
-        strategies = []
-
-        # Strategy 1: Press Enter on the focused element
-        strategies.append(("Enter key", lambda: self._page.keyboard.press("Enter")))
-
-        # Strategy 2: Find and click any submit button in the form
-        strategies.append(("submit button", lambda: self._page.evaluate(f"""() => {{
-            const el = document.querySelector({json.dumps(selector)});
-            if (!el) return false;
-            const form = el.closest('form');
-            if (!form) return false;
-            const btn = form.querySelector('button[type=submit], input[type=submit], button:has(svg), button[aria-label*=search i], button:last-of-type');
-            if (btn) {{ btn.click(); return true; }}
-            return false;
-        }}""")))
-
-        # Strategy 3: JS form.submit()
-        strategies.append(("form.submit()", lambda: self._page.evaluate(f"""() => {{
-            const el = document.querySelector({json.dumps(selector)});
-            if (!el) return false;
-            const form = el.closest('form');
-            if (form) {{ form.submit(); return true; }}
-            return false;
-        }}""")))
-
-        # Strategy 4: Dispatch submit event on form
-        strategies.append(("submit event", lambda: self._page.evaluate(f"""() => {{
-            const el = document.querySelector({json.dumps(selector)});
-            if (!el) return false;
-            const form = el.closest('form');
-            if (form) {{
-                form.dispatchEvent(new Event('submit', {{ bubbles: true, cancelable: true }}));
-                return true;
-            }}
-            return false;
-        }}""")))
-
-        # Strategy 5: Click any nearby button
-        strategies.append(("nearby button", lambda: self._page.evaluate(f"""() => {{
-            const el = document.querySelector({json.dumps(selector)});
-            if (!el) return false;
-            const form = el.closest('form');
-            if (form) {{
-                const btns = form.querySelectorAll('button');
-                if (btns.length > 0) {{ btns[0].click(); return true; }}
-            }}
-            const parent = el.parentElement;
-            if (parent) {{
-                const btn = parent.querySelector('button, input[type=submit]');
-                if (btn) {{ btn.click(); return true; }}
-            }}
-            return false;
-        }}""")))
-
-        for name, strategy in strategies:
-            try:
-                result = strategy()
-                if result is not False and result is not None:
-                    return {"submitted": True, "strategy": name}
-            except Exception:
-                continue
-
-        return {"error": "all form submission strategies failed"}
-
-    def __enter__(self) -> BrowserFetcher:
-        return self
-
-    def __exit__(self, *args) -> None:
-        self.close()
-
-    def close(self):
-        exc = None
-        if self._page:
-            try:
-                self._page.close()
-            except Exception as e:
-                exc = e
-        if self._context:
-            try:
-                self._context.close()
-            except Exception as e:
-                exc = e
-        if self._browser:
-            try:
-                self._browser.close()
-            except Exception as e:
-                exc = e
-        if self._playwright:
-            try:
-                self._playwright.stop()
-            except Exception as e:
-                exc = e
-        if exc:
-            raise exc
