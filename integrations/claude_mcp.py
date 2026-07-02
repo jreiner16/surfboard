@@ -327,7 +327,7 @@ class SurfboardMCPServer:
             "result": {
                 "protocolVersion": client_version,
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "surfboard", "version": "0.1.0", "options": {"block_resources": self.api.fetcher.block_resources, "proxy": self.api.fetcher.proxy, "calls_per_sec": self.api.fetcher.rate_limiter._min_interval, "cache_ttl": self.api._page_cache._default_ttl}},
+                "serverInfo": {"name": "surfboard", "version": "0.1.0", "options": {"block_resources": self.api.fetcher.block_resources, "proxy": self.api.fetcher.proxy, "calls_per_sec": self.api.fetcher.rate_limiter.calls_per_sec, "cache_ttl": self.api._page_cache.default_ttl}},
             },
         }
 

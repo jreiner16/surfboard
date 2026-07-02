@@ -69,3 +69,7 @@ class PageCache:
     def size(self) -> int:
         with self._lock:
             return len(self._cache)
+
+    @property
+    def default_ttl(self) -> float:
+        return self._default_ttl

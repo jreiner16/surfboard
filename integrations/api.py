@@ -7,13 +7,12 @@ import re
 import sys
 import time
 import urllib.parse
-from pathlib import Path
 from typing import Any, Optional
 
 from surfboard.browser import BrowserFetcher
 from surfboard.cache import PageCache
 from surfboard.log import get_logger
-from surfboard.models import ElementType, Section, Session
+from surfboard.models import ElementType, Section, Session, Tab
 from surfboard.serializers import page_to_dict, section_to_dict
 from surfboard.tree import build_page
 
@@ -334,7 +333,7 @@ class SurfboardAPI:
                 self.fetcher.wait_for_load(timeout_ms=10000)
             except Exception as e:
                 nav_error = str(e)
-                _logger.warn("click", f"Post-click navigation warning: {nav_error}", "warn")
+                _logger.warning("click", f"Post-click navigation warning: {nav_error}", "warn")
 
             html = self.fetcher.content()
             url = self.fetcher.current_url() or tab.url
@@ -446,7 +445,7 @@ class SurfboardAPI:
                     tab.page = build_page(html, current_url, current_url)
                     result["page"] = page_to_dict(tab.page)
             except Exception as e:
-                _logger.warn("fill_and_submit", f"Page rebuild failed after submit: {e}", "error")
+                _logger.warning("fill_and_submit", f"Page rebuild failed after submit: {e}", "error")
                 result["page_error"] = str(e)
         return result
 
@@ -462,7 +461,7 @@ class SurfboardAPI:
     def get_console_logs(self, tab_id: int | None = None) -> dict[str, Any]:
         if tab_id is not None:
             self.session.switch_tab(tab_id)
-        return _ok(logs=self.fetcher.get_console_logs())
+        return _ok(logs=self.fetcher.get_console_logs(tab_id))
 
     def _get_full_text(self, tab_id: int | None = None) -> dict[str, Any]:
         if tab_id is not None:
@@ -523,13 +522,15 @@ class SurfboardAPI:
         except Exception as e:
             return _err(str(e))
 
-    def _back(self) -> dict[str, Any]:
+    def _navigate_history(self, direction: str) -> dict[str, Any]:
+        go = self.fetcher.go_back if direction == "back" else self.fetcher.go_forward
+        key = direction  # "back" or "forward"
         MAX_DEPTH = 10
         for _ in range(MAX_DEPTH):
             try:
-                nav_result = self.fetcher.go_back()
+                nav_result = go()
                 if "error" in nav_result:
-                    return _ok(back=False, error=nav_result["error"])
+                    return _ok(**{key: False, "error": nav_result["error"]})
                 self.fetcher.wait_for_load(timeout_ms=5000)
                 html = self.fetcher.content()
                 url = self.fetcher.current_url()
@@ -537,35 +538,19 @@ class SurfboardAPI:
                 if tab and html and not url.startswith("chrome-error:"):
                     tab.url = url
                     tab.page = build_page(html, url, url)
-                    return _ok(back=True, url=url)
+                    return _ok(**{key: True, "url": url})
                 if url.startswith("chrome-error:") or url in ("about:blank", ""):
                     continue
-                return _ok(back=True, url=url)
+                return _ok(**{key: True, "url": url})
             except Exception as e:
-                return _ok(back=False, error=str(e))
-        return _ok(back=False, error="too many error pages in history")
+                return _ok(**{key: False, "error": str(e)})
+        return _ok(**{key: False, "error": "too many error pages in history"})
+
+    def _back(self) -> dict[str, Any]:
+        return self._navigate_history("back")
 
     def _forward(self) -> dict[str, Any]:
-        MAX_DEPTH = 10
-        for _ in range(MAX_DEPTH):
-            try:
-                nav_result = self.fetcher.go_forward()
-                if "error" in nav_result:
-                    return _ok(forward=False, error=nav_result["error"])
-                self.fetcher.wait_for_load(timeout_ms=5000)
-                html = self.fetcher.content()
-                url = self.fetcher.current_url()
-                tab = self.session.active_tab
-                if tab and html and not url.startswith("chrome-error:"):
-                    tab.url = url
-                    tab.page = build_page(html, url, url)
-                    return _ok(forward=True, url=url)
-                if url.startswith("chrome-error:") or url in ("about:blank", ""):
-                    continue
-                return _ok(forward=True, url=url)
-            except Exception as e:
-                return _ok(forward=False, error=str(e))
-        return _ok(forward=False, error="too many error pages in history")
+        return self._navigate_history("forward")
 
     # -- Tab management -----------------------------------------------------
 
@@ -617,7 +602,7 @@ class SurfboardAPI:
             return _ok(tab_id=tab.id, page=page_to_dict(tab.page))
         return _ok(page=None)
 
-    def _expand(self, section_id: int, tab_id: int | None = None, minimal: bool | None = None) -> dict[str, Any]:
+    def _set_collapsed(self, section_id: int, collapsed: bool, tab_id: int | None = None, minimal: bool | None = None) -> dict[str, Any]:
         if minimal is None:
             minimal = True
         if tab_id is not None:
@@ -629,29 +614,18 @@ class SurfboardAPI:
         section = cache.get(section_id)
         if not section:
             return _err(f"No section with ID {section_id}")
-        section.collapsed = False
-        result: dict[str, Any] = _ok(tab_id=tab.id, expanded=section_id)
+        section.collapsed = collapsed
+        key = "collapsed" if collapsed else "expanded"
+        result: dict[str, Any] = _ok(tab_id=tab.id, **{key: section_id})
         if not minimal:
             result["page"] = page_to_dict(tab.page)
         return result
 
+    def _expand(self, section_id: int, tab_id: int | None = None, minimal: bool | None = None) -> dict[str, Any]:
+        return self._set_collapsed(section_id, False, tab_id, minimal)
+
     def _collapse(self, section_id: int, tab_id: int | None = None, minimal: bool | None = None) -> dict[str, Any]:
-        if minimal is None:
-            minimal = True
-        if tab_id is not None:
-            self.session.switch_tab(tab_id)
-        tab = self.session.active_tab
-        if not tab or not tab.page:
-            return _err("No page loaded")
-        cache = _build_section_cache(tab.page)
-        section = cache.get(section_id)
-        if not section:
-            return _err(f"No section with ID {section_id}")
-        section.collapsed = True
-        result: dict[str, Any] = _ok(tab_id=tab.id, collapsed=section_id)
-        if not minimal:
-            result["page"] = page_to_dict(tab.page)
-        return result
+        return self._set_collapsed(section_id, True, tab_id, minimal)
 
     def _get_section(self, section_id: int, tab_id: int | None = None) -> dict[str, Any]:
         if tab_id is not None:
@@ -683,7 +657,7 @@ class SurfboardAPI:
 
     def _status(self) -> dict[str, Any]:
         tab = self.session.active_tab
-        logs = self.fetcher.peek_console_logs()
+        logs = self.fetcher.peek_console_logs(tab.id if tab else None)
         result = _ok(
             tabs=len(self.session.tabs),
             active_tab=self.session.active_tab_id,

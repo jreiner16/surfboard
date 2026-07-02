@@ -361,6 +361,64 @@ class TestBrowserFetcher(unittest.TestCase):
         result = bf.fetch("https://example.com")
         self.assertIn("playwright not installed", result.error or "")
 
+    def test_console_logs_filtered_by_tab_id(self):
+        from surfboard.browser import BrowserFetcher
+        bf = BrowserFetcher()
+        bf._console_logs = [
+            (1, "log from tab 1"),
+            (2, "log from tab 2"),
+            (1, "another log from tab 1"),
+        ]
+        tab1_logs = bf.get_console_logs(tab_id=1)
+        self.assertEqual(tab1_logs, ["log from tab 1", "another log from tab 1"])
+        remaining = [msg for _, msg in bf._console_logs]
+        self.assertEqual(remaining, ["log from tab 2"])
+
+    def test_console_logs_get_all_when_no_tab_id(self):
+        from surfboard.browser import BrowserFetcher
+        bf = BrowserFetcher()
+        bf._console_logs = [
+            (1, "log A"),
+            (2, "log B"),
+        ]
+        all_logs = bf.get_console_logs()
+        self.assertEqual(all_logs, ["log A", "log B"])
+        self.assertEqual(bf._console_logs, [])
+
+    def test_console_logs_peek_respects_tab_id(self):
+        from surfboard.browser import BrowserFetcher
+        bf = BrowserFetcher()
+        bf._console_logs = [
+            (1, "tab 1 msg"),
+            (2, "tab 2 msg"),
+        ]
+        peeked = bf.peek_console_logs(tab_id=1)
+        self.assertEqual(peeked, ["tab 1 msg"])
+        self.assertEqual(len(bf._console_logs), 2)
+
+    def test_fill_returns_visibility_error_for_hidden_element(self):
+        from surfboard.browser import BrowserFetcher
+        bf = BrowserFetcher()
+        bf._page = Mock()
+        bf._page.evaluate.side_effect = [
+            'hidden',
+            None,  # event dispatch eval
+        ]
+        result = bf.fill("input[name='q']", "test")
+        self.assertIn("error", result)
+        self.assertIn("not visible", result["error"].lower())
+
+    def test_scroll_to_uses_query_selector_instead_of_document_query(self):
+        from surfboard.browser import BrowserFetcher
+        bf = BrowserFetcher()
+        mock_el = Mock()
+        bf._page = Mock()
+        bf._page.query_selector.return_value = mock_el
+        result = bf.scroll_to("a:has-text('Skip')", [])
+        self.assertIn("scrolled_to", result)
+        bf._page.query_selector.assert_called_once_with("a:has-text('Skip')")
+        mock_el.evaluate.assert_called_once()
+
 
 class TestPageCache(unittest.TestCase):
     def test_get_set(self):

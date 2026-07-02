@@ -7,7 +7,9 @@ import hashlib
 import io
 import json
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 import urllib.request
 
 from surfboard.fetcher import FetchResult, _is_bot_block
@@ -41,6 +43,10 @@ class RateLimiter:
     def __init__(self, calls_per_sec: float = 10.0):
         self._min_interval = 1.0 / max(calls_per_sec, 0.1)
         self._last_call = 0.0
+
+    @property
+    def calls_per_sec(self) -> float:
+        return 1.0 / self._min_interval if self._min_interval > 0 else 0.0
 
     def acquire(self) -> float:
         now = time.time()
@@ -80,13 +86,13 @@ class BrowserFetcher:
         self._playwright = None
         self._browser = None
         self._context = None
-        self._pages: dict[int, object] = {}       # tab_id → Playwright Page
+        self._pages: dict[int, Any] = {}           # tab_id → Playwright Page
         self._active_tab_id: int | None = None
-        self._page: object | None = None           # cached ref to active page
-        self._console_logs: list[str] = []
+        self._page: Any = None                     # cached ref to active page
+        self._console_logs: list[tuple[int, str]] = []  # (tab_id, message)
         self._last_cookie_hash: str | None = None
         self._resource_block_enabled = block_resources
-        self._request_interceptors: list[callable] = []
+        self._request_interceptors: list[Callable] = []
 
     # -- Lifecycle ----------------------------------------------------------
 
@@ -134,7 +140,8 @@ class BrowserFetcher:
                 RESOURCE_BLOCK_PATTERNS,
                 lambda route: route.abort(),
             )
-        page.on("console", lambda msg: self._console_logs.append(f"[{msg.type}] {msg.text}"))
+        current_tab_id = self._active_tab_id
+        page.on("console", lambda msg, tid=current_tab_id: self._console_logs.append((tid, f"[{msg.type}] {msg.text}")))
         page.on("request", lambda req: self._on_request(req))
 
     def create_page(self, tab_id: int) -> bool:
@@ -184,9 +191,9 @@ class BrowserFetcher:
             try:
                 fn(request)
             except Exception:
-                _logger.warn("interceptor", "request interceptor failed", "error")
+                _logger.warning("interceptor", "request interceptor failed", "error")
 
-    def add_request_interceptor(self, fn: callable) -> None:
+    def add_request_interceptor(self, fn: Callable) -> None:
         """Register a callback receiving Playwright Request objects."""
         self._request_interceptors.append(fn)
 
@@ -330,18 +337,12 @@ class BrowserFetcher:
                 )
             except Exception as e:
                 if attempt == 0 and self._try_restart():
-                    _logger.warn("browse", f"Navigation failed, recovered via restart: {e}", "warn")
+                    _logger.warning("browse", f"Navigation failed, recovered via restart: {e}", "warn")
                     continue
                 return FetchResult(
                     url=url, html="", status_code=0, headers={}, final_url=url,
                     error=str(e),
                 )
-        # unreachable
-        return FetchResult(
-            url=url, html="", status_code=0, headers={}, final_url=url,
-            error="unknown fetch error",
-        )
-
     def go_back(self) -> dict:
         if not self._page:
             return {"error": "no page loaded"}
@@ -431,14 +432,14 @@ class BrowserFetcher:
             result = self._page.evaluate(js_code)
             output = str(result) if result is not None else "null"
             if not quiet:
-                logs = self.get_console_logs()
+                logs = self.get_console_logs(self._active_tab_id)
                 if logs:
                     output += "\n[console]\n" + "\n".join(logs)
             return output
         except Exception as e:
             msg = f"error: {e}"
             if not quiet:
-                logs = self.get_console_logs()
+                logs = self.get_console_logs(self._active_tab_id)
                 if logs:
                     msg += "\n[console]\n" + "\n".join(logs)
             return msg
@@ -503,13 +504,19 @@ class BrowserFetcher:
 
     # -- Console logs -------------------------------------------------------
 
-    def get_console_logs(self) -> list[str]:
-        logs = list(self._console_logs)
+    def get_console_logs(self, tab_id: int | None = None) -> list[str]:
+        if tab_id is not None:
+            matching = [msg for tid, msg in self._console_logs if tid == tab_id]
+            self._console_logs = [(tid, msg) for tid, msg in self._console_logs if tid != tab_id]
+            return matching
+        logs = [msg for _, msg in self._console_logs]
         self._console_logs = []
         return logs
 
-    def peek_console_logs(self) -> list[str]:
-        return list(self._console_logs)
+    def peek_console_logs(self, tab_id: int | None = None) -> list[str]:
+        if tab_id is not None:
+            return [msg for tid, msg in self._console_logs if tid == tab_id]
+        return [msg for _, msg in self._console_logs]
 
     # -- Element interaction ------------------------------------------------
 
@@ -521,68 +528,52 @@ class BrowserFetcher:
             }}""")
             self._page.wait_for_timeout(200)
         except Exception:
-            _logger.warn("scroll", f"scrollIntoView failed for {selector}", "warn")
+            _logger.warning("scroll", f"scrollIntoView failed for {selector}", "warn")
+
+    def _try_selectors(
+        self, selector: str, fallback_selectors: list[str] | None,
+        action: Callable[[Any, str], dict], error_label: str,
+    ) -> dict:
+        selectors_to_try = [selector]
+        if fallback_selectors:
+            selectors_to_try.extend(fallback_selectors)
+        last_error = None
+        for sel in selectors_to_try:
+            try:
+                el = self._page.query_selector(sel)
+                if el:
+                    return action(el, sel)
+            except Exception as e:
+                last_error = str(e)
+                continue
+        return {"error": f"{error_label} failed for all selectors: {last_error}"}
 
     def click(self, selector: str, fallback_selectors: list[str] | None = None) -> dict:
         if not self._page:
             return {"error": "no page loaded"}
         self.rate_limiter.acquire()
-        selectors_to_try = [selector]
-        if fallback_selectors:
-            selectors_to_try.extend(fallback_selectors)
-
-        last_error = None
-        for sel in selectors_to_try:
-            try:
-                el = self._page.query_selector(sel)
-                if el:
-                    self._scroll_into_view(sel)
-                    self._page.click(sel, timeout=15000)
-                    return {"clicked": sel, "selector_used": sel}
-            except Exception as e:
-                last_error = str(e)
-                continue
-
-        return {"error": f"click failed for all selectors: {last_error}"}
+        def _do_click(el: Any, sel: str) -> dict:
+            self._scroll_into_view(sel)
+            self._page.click(sel, timeout=15000)
+            return {"clicked": sel, "selector_used": sel}
+        return self._try_selectors(selector, fallback_selectors, _do_click, "click")
 
     def hover(self, selector: str, fallback_selectors: list[str] | None = None) -> dict:
         if not self._page:
             return {"error": "no page loaded"}
-        selectors_to_try = [selector]
-        if fallback_selectors:
-            selectors_to_try.extend(fallback_selectors)
-        last_error = None
-        for sel in selectors_to_try:
-            try:
-                el = self._page.query_selector(sel)
-                if el:
-                    self._page.hover(sel, timeout=10000)
-                    return {"hovered": sel, "selector_used": sel}
-            except Exception as e:
-                last_error = str(e)
-                continue
-        return {"error": f"hover failed for all selectors: {last_error}"}
+        def _do_hover(el: Any, sel: str) -> dict:
+            self._page.hover(sel, timeout=10000)
+            return {"hovered": sel, "selector_used": sel}
+        return self._try_selectors(selector, fallback_selectors, _do_hover, "hover")
 
     def scroll_to(self, selector: str, fallback_selectors: list[str] | None = None) -> dict:
         if not self._page:
             return {"error": "no page loaded"}
-        selectors_to_try = [selector]
-        if fallback_selectors:
-            selectors_to_try.extend(fallback_selectors)
-        for sel in selectors_to_try:
-            try:
-                result = self._page.evaluate(f"""() => {{
-                    const el = document.querySelector({json.dumps(sel)});
-                    if (!el) return null;
-                    el.scrollIntoView({{block: 'center', behavior: 'instant'}});
-                    return true;
-                }}""")
-                if result is True:
-                    self._page.wait_for_timeout(200)
-                    return {"scrolled_to": sel, "selector_used": sel}
-            except Exception:
-                continue
-        return {"error": f"Element not found for any selector (tried {len(selectors_to_try)} selectors)"}
+        def _do_scroll(el: Any, sel: str) -> dict:
+            el.evaluate("el => el.scrollIntoView({block: 'center', behavior: 'instant'})")
+            self._page.wait_for_timeout(200)
+            return {"scrolled_to": sel, "selector_used": sel}
+        return self._try_selectors(selector, fallback_selectors, _do_scroll, "scroll_to")
 
     def scroll_by(self, x: int, y: int) -> dict:
         if not self._page:
@@ -606,6 +597,19 @@ class BrowserFetcher:
         if not self._page:
             return {"error": "no page loaded"}
         try:
+            visible = self._page.evaluate(f"""() => {{
+                const el = document.querySelector({json.dumps(selector)});
+                if (!el) return 'not_found';
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden' ||
+                    style.opacity === '0' || rect.width === 0 || rect.height === 0) {{
+                    return 'hidden';
+                }}
+                return 'visible';
+            }}""")
+            if visible == 'hidden':
+                return {"error": f"Element is not visible (hidden, zero-size, or covered). Reveal it first (click a toggle/press Tab) then retry."}
             self._scroll_into_view(selector)
             self._page.fill(selector, text)
             self._page.evaluate(f"""() => {{

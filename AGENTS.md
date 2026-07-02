@@ -21,7 +21,7 @@ When you need to browse the web, search, or fetch live content, use the `surfboa
 - `surfboard_fill_and_submit` — Type text into an input and press Enter. Pass `element_id`, `text`.
 - `surfboard_press_key` — Press a keyboard key (e.g., 'Enter', 'Escape').
 - `surfboard_clipboard_copy` / `surfboard_clipboard_read` — Browser clipboard access.
-- `surfboard_highlight` — Highlight elements by their IDs (yellow outline). Pass `eids` array.
+- `surfboard_highlight` — Highlight elements by their IDs (yellow outline). Pass `eids` array. Pass empty array `[]` to clear all highlights.
 - `surfboard_scroll_by` / `surfboard_scroll_to` — Scroll the viewport or an element into view.
 - `surfboard_hover` — Hover over an element by its ID.
 

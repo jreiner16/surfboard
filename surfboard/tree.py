@@ -62,10 +62,10 @@ def build_page(html: str, url: str, final_url: str) -> Page:
 def _extract_title(soup: BeautifulSoup) -> str:
     title_tag = soup.find("title")
     if title_tag:
-        return title_tag.get_text(strip=True)
+        return title_tag.get_text(separator=" ", strip=True)
     h1 = soup.find("h1")
     if h1:
-        return h1.get_text(strip=True)
+        return h1.get_text(separator=" ", strip=True)
     return ""
 
 
@@ -90,7 +90,7 @@ def _build_sections(
     sections: list[Section] = []
     for i, h in enumerate(headings):
         level = int(h.name[1])
-        title = h.get_text(strip=True)
+        title = h.get_text(separator=" ", strip=True)
         if not title:
             continue
 

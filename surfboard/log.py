@@ -62,8 +62,11 @@ class SurfboardLogger:
     def info(self, tool: str, detail: str, status: str = "ok") -> None:
         self.log(tool, detail, status, "info")
 
-    def warn(self, tool: str, detail: str, status: str = "warn") -> None:
+    def warning(self, tool: str, detail: str, status: str = "warn") -> None:
         self.log(tool, detail, status, "warn")
+
+    def warn(self, tool: str, detail: str, status: str = "warn") -> None:
+        return self.warning(tool, detail, status)
 
     def error(self, tool: str, detail: str, status: str = "error") -> None:
         self.log(tool, detail, status, "error")
